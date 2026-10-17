@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.log
+adapter_rollback_snapshot.json
+dist/
+build/
+.pytest_cache/

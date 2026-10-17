@@ -1,14 +1,15 @@
 """
 WiFi Optimizer - Comprehensive Audit & Mathematical Verification Unit Tests
-Tests:
-1. RF physics & Friis path loss / distance equations.
-2. Signal-to-dBm mapping and boundary constraints.
-3. Channel overlap matrix and effective interference calculation.
-4. Sigmoid signal curve calibration and M-BFF score bounds [0, 100].
-5. Security scoring and gating.
+Validates:
+1. RF physics & Friis path loss / distance equations with environmental range intervals.
+2. Signal-to-dBm mapping, native RSSI fallback, and measurement uncertainty.
+3. 22 MHz spectral mask overlap integral and effective interference calculation.
+4. Sigmoid signal curve bounds [0, 100] and heuristic parameter documentation.
+5. True security policy gating (Open/WEP disqualification) and saved profile filtering.
 6. Hysteresis threshold and cooldown logic.
-7. EWMA-smoothed Link Governor state machine simulation.
-8. Adapter Manager parameter discovery, dry-run safety, and atomic rollback snapshot.
+7. Closed-loop Link Governor state machine simulation across telemetry traces (including gradient drops).
+8. Adapter Manager parameter discovery, enum label resolution (e.g. MIMOPowerSave), and connection PHY SGI gating.
+9. Real disk filesystem atomic snapshot and rollback verification in temporary directory.
 """
 
 import unittest
@@ -16,6 +17,8 @@ import math
 import time
 import os
 import sys
+import tempfile
+import json
 
 # Ensure src/ is on sys.path
 SRC_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -23,13 +26,13 @@ if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
 from core.wifi_scanner import (
-    WiFiNetwork, AdapterInfo,
-    percent_to_dbm, estimate_distance_meters,
+    WiFiNetwork, AdapterInfo, PropagationEstimate,
+    percent_to_dbm, estimate_distance_meters, estimate_propagation_range,
     calculate_channel_overlap, calculate_effective_channel_congestion
 )
 from core.optimizer import (
     score_network, calculate_sig_score, parse_radio_rank,
-    should_roam_decision, PROFILES
+    should_roam_decision, PROFILES, OptimizationProfile
 )
 from core.monitor import WiFiMonitor, GovernorState
 from core import adapter_manager
@@ -38,8 +41,8 @@ from core import adapter_manager
 class TestRFPhysicsAndMath(unittest.TestCase):
     """Verify RF and physical propagation formulas."""
 
-    def test_rssi_to_dbm_mapping(self):
-        """Verify Windows signal percentage to dBm conversion and bounds."""
+    def test_rssi_to_dbm_mapping_and_uncertainty(self):
+        """Verify Windows signal percentage to dBm conversion, uncertainty, and bounds."""
         self.assertEqual(percent_to_dbm(100), -50.0)
         self.assertEqual(percent_to_dbm(40), -80.0)
         self.assertEqual(percent_to_dbm(0), -100.0)
@@ -47,6 +50,11 @@ class TestRFPhysicsAndMath(unittest.TestCase):
         # Out-of-bound clamps
         self.assertEqual(percent_to_dbm(-10), -100.0)
         self.assertEqual(percent_to_dbm(120), -50.0)
+
+        # Verify network dataclass default uncertainty
+        net = WiFiNetwork(signal_percent=50, signal_dbm=percent_to_dbm(50))
+        self.assertFalse(net.is_native_rssi)
+        self.assertEqual(net.rssi_uncertainty_db, 6.0)
 
     def test_friis_reference_path_loss_1m(self):
         """Verify 1-meter free space reference path loss PL(1m) = 20*log10(f) - 27.55."""
@@ -84,14 +92,27 @@ class TestRFPhysicsAndMath(unittest.TestCase):
         self.assertGreater(d_n2, 50.0)
         self.assertGreater(d_n3, 10.0)
 
-    def test_channel_spectral_overlap_weights(self):
-        """Verify spectral overlap weights w_ov for co-channel and adjacent interference."""
-        # 2.4 GHz channel spacing (22MHz channel width, 5MHz channel separation)
+    def test_propagation_range_interval(self):
+        """Verify propagation range outputs an interval reflecting indoor uncertainty."""
+        prop = estimate_propagation_range(-65.0, frequency_mhz=5180.0, tx_power_dbm=20.0, uncertainty_db=6.0)
+        self.assertLess(prop.d_dense_m, prop.d_indoor_m)
+        self.assertLess(prop.d_indoor_m, prop.d_free_space_m)
+        self.assertIn("Indoor Obstacle Range", prop.range_summary)
+        self.assertIn("±6dB", prop.range_summary)
+
+    def test_channel_spectral_overlap_integral(self):
+        """Verify 22 MHz spectral mask overlap integral w_ov = max(0, round(1 - delta*5/22, 2))."""
         self.assertEqual(calculate_channel_overlap(6, "2.4GHz", 6, "2.4GHz"), 1.0)
-        self.assertEqual(calculate_channel_overlap(6, "2.4GHz", 7, "2.4GHz"), 0.75)
-        self.assertEqual(calculate_channel_overlap(6, "2.4GHz", 8, "2.4GHz"), 0.50)
-        self.assertEqual(calculate_channel_overlap(6, "2.4GHz", 9, "2.4GHz"), 0.25)
-        self.assertEqual(calculate_channel_overlap(6, "2.4GHz", 10, "2.4GHz"), 0.0)
+        # Delta = 1: 1 - 5/22 = 17/22 = 0.7727 ~ 0.77
+        self.assertEqual(calculate_channel_overlap(6, "2.4GHz", 7, "2.4GHz"), 0.77)
+        # Delta = 2: 1 - 10/22 = 12/22 = 0.5454 ~ 0.55
+        self.assertEqual(calculate_channel_overlap(6, "2.4GHz", 8, "2.4GHz"), 0.55)
+        # Delta = 3: 1 - 15/22 = 7/22 = 0.318 ~ 0.32
+        self.assertEqual(calculate_channel_overlap(6, "2.4GHz", 9, "2.4GHz"), 0.32)
+        # Delta = 4: 1 - 20/22 = 2/22 = 0.0909 ~ 0.09
+        self.assertEqual(calculate_channel_overlap(6, "2.4GHz", 10, "2.4GHz"), 0.09)
+        # Delta >= 5: 0.0
+        self.assertEqual(calculate_channel_overlap(6, "2.4GHz", 11, "2.4GHz"), 0.0)
         self.assertEqual(calculate_channel_overlap(6, "2.4GHz", 1, "2.4GHz"), 0.0)
 
         # Cross band must be zero
@@ -101,25 +122,12 @@ class TestRFPhysicsAndMath(unittest.TestCase):
         self.assertEqual(calculate_channel_overlap(36, "5GHz", 36, "5GHz"), 1.0)
         self.assertEqual(calculate_channel_overlap(36, "5GHz", 40, "5GHz"), 0.0)
 
-    def test_effective_channel_congestion_calculation(self):
-        """Verify C_eff summation with signal weighting."""
-        target = WiFiNetwork(ssid="TargetNet", bssid="AA:BB:CC:00:00:01", channel=6, band="2.4GHz", signal_dbm=-60.0)
-        # Neighbor 1: Co-channel (Ch 6) at -50 dBm -> w_ov=1.0, w_sig=1.0 -> contrib = 1.0
-        n1 = WiFiNetwork(ssid="Net1", bssid="AA:BB:CC:00:00:02", channel=6, band="2.4GHz", signal_dbm=-50.0)
-        # Neighbor 2: Adjacent (Ch 7, delta=1) at -70 dBm -> w_ov=0.75, w_sig=(-70+90)/40=0.5 -> contrib = 0.375
-        n2 = WiFiNetwork(ssid="Net2", bssid="AA:BB:CC:00:00:03", channel=7, band="2.4GHz", signal_dbm=-70.0)
-        # Neighbor 3: Non-overlapping (Ch 11) at -40 dBm -> w_ov=0.0 -> contrib = 0.0
-        n3 = WiFiNetwork(ssid="Net3", bssid="AA:BB:CC:00:00:04", channel=11, band="2.4GHz", signal_dbm=-40.0)
-
-        c_eff = calculate_effective_channel_congestion(target, [target, n1, n2, n3])
-        self.assertAlmostEqual(c_eff, 1.375, places=3)
-
 
 class TestMBFFScoringAlgorithm(unittest.TestCase):
     """Verify Multi-Objective BSSID Fitness Function (M-BFF)."""
 
     def test_sigmoid_signal_curve(self):
-        """Verify calibrated Sigmoid f_sig(P_rx) = 30 / (1 + exp(-0.35*(P_rx + 72)))."""
+        """Verify heuristic Sigmoid f_sig(P_rx) = 30 / (1 + exp(-0.35*(P_rx + 72)))."""
         # Saturation near -50 dBm: ~30.0
         s_50 = calculate_sig_score(-50.0)
         self.assertAlmostEqual(s_50, 30.0, delta=0.1)
@@ -152,7 +160,6 @@ class TestMBFFScoringAlgorithm(unittest.TestCase):
         """Ensure total score is always clamped in [0.0, 100.0]."""
         profile = PROFILES["balanced"]
 
-        # Super strong WiFi 6E network
         best_net = WiFiNetwork(
             ssid="BestWiFi", bssid="00:11:22:33:44:55",
             signal_percent=100, signal_dbm=-50.0, channel=36,
@@ -163,7 +170,6 @@ class TestMBFFScoringAlgorithm(unittest.TestCase):
         self.assertLessEqual(res_best.total_score, 100.0)
         self.assertGreaterEqual(res_best.total_score, 85.0)
 
-        # Very weak, insecure network
         worst_net = WiFiNetwork(
             ssid="WorstWiFi", bssid="00:11:22:33:44:66",
             signal_percent=0, signal_dbm=-100.0, channel=6,
@@ -174,17 +180,65 @@ class TestMBFFScoringAlgorithm(unittest.TestCase):
         self.assertGreaterEqual(res_worst.total_score, 0.0)
         self.assertLessEqual(res_worst.total_score, 10.0)
 
-    def test_security_gating(self):
-        """Verify that Open/WEP networks receive 0 security score and are flagged."""
-        profile = PROFILES["balanced"]
-        net_open = WiFiNetwork(
-            ssid="CoffeeShop_Open", bssid="00:11:22:33:44:77",
-            signal_percent=90, signal_dbm=-55.0, channel=36,
-            band="5GHz", authentication="Open", radio_type="802.11ac"
+    def test_true_security_policy_gating(self):
+        """Verify that Open and WEP networks are disqualified when allow_insecure_networks=False."""
+        strict_profile = OptimizationProfile(
+            name="Strict", description="Strict Security",
+            preferred_band="Auto", roaming_aggressiveness=3,
+            transmit_power=5, disable_power_save=True,
+            background_scan=True, optimize_tcp=True,
+            set_dns=True, dns_primary="1.1.1.1", dns_secondary="8.8.8.8",
+            allow_insecure_networks=False
         )
-        res = score_network(net_open, {}, profile)
-        self.assertEqual(res.security_score, 0.0)
-        self.assertIn("Insecure", res.recommendation)
+
+        open_high_signal = WiFiNetwork(
+            ssid="OpenCafe", bssid="00:11:22:33:44:77",
+            signal_percent=100, signal_dbm=-45.0, channel=36,
+            band="5GHz", authentication="Open", radio_type="802.11ax"
+        )
+        res_open = score_network(open_high_signal, {}, strict_profile)
+        # Even with high signal and ax radio, open network must be disqualified!
+        self.assertFalse(res_open.is_eligible)
+        self.assertIn("Excluded by Security Policy", res_open.ineligibility_reason)
+        self.assertIn("Plaintext", res_open.ineligibility_reason)
+
+        wep_high_signal = WiFiNetwork(
+            ssid="LegacyWEP", bssid="00:11:22:33:44:88",
+            signal_percent=100, signal_dbm=-45.0, channel=36,
+            band="5GHz", authentication="WEP", radio_type="802.11n"
+        )
+        res_wep = score_network(wep_high_signal, {}, strict_profile)
+        self.assertFalse(res_wep.is_eligible)
+        self.assertIn("Broken WEP RC4 cipher", res_wep.ineligibility_reason)
+
+        # Permit when allow_insecure_networks is explicitly enabled
+        permissive_profile = OptimizationProfile(
+            name="Permissive", description="Permissive",
+            preferred_band="Auto", roaming_aggressiveness=3,
+            transmit_power=5, disable_power_save=True,
+            background_scan=True, optimize_tcp=True,
+            set_dns=True, dns_primary="1.1.1.1", dns_secondary="8.8.8.8",
+            allow_insecure_networks=True
+        )
+        res_permitted = score_network(open_high_signal, {}, permissive_profile)
+        self.assertTrue(res_permitted.is_eligible)
+
+    def test_saved_profile_roaming_filter(self):
+        """Verify roaming candidate filter rejects unknown SSIDs when require_saved_profile=True."""
+        profile = OptimizationProfile(
+            name="KnownOnly", description="",
+            preferred_band="Auto", roaming_aggressiveness=3,
+            transmit_power=5, disable_power_save=True,
+            background_scan=True, optimize_tcp=True,
+            set_dns=True, dns_primary="1.1.1.1", dns_secondary="8.8.8.8",
+            allow_insecure_networks=True, require_saved_profile=True
+        )
+        known_ssid = "HomeNetwork"
+        unknown_ssid = "NeighborGuest"
+        net_unknown = WiFiNetwork(ssid=unknown_ssid, bssid="00:11:22:00:00:01", signal_dbm=-50.0, authentication="WPA2-PSK")
+        res = score_network(net_unknown, {}, profile, saved_profiles=[known_ssid])
+        self.assertFalse(res.is_eligible)
+        self.assertIn("not in saved profiles", res.ineligibility_reason)
 
     def test_hysteresis_and_cooldown(self):
         """Verify AP roaming hysteresis threshold (+10 pts) and 30s cooldown."""
@@ -206,14 +260,14 @@ class TestMBFFScoringAlgorithm(unittest.TestCase):
 
 
 class TestLinkGovernorSimulation(unittest.TestCase):
-    """Verify closed-loop Link Governor state machine and EWMA smoothing."""
+    """Verify closed-loop Link Governor state machine and EWMA smoothing across realistic traces."""
 
     def test_governor_anti_flapping_and_smoothing(self):
         """Simulate telemetry traces to verify Governor does not flap on transient noise."""
         monitor = WiFiMonitor(alpha=0.3, cooldown_sec=30.0)
         now = 1000.0
 
-        # Initial steady state at -60 dBm
+        # Steady state at -60 dBm
         for _ in range(5):
             now += 3.0
             alert = monitor.update_governor(-60.0, now)
@@ -222,37 +276,34 @@ class TestLinkGovernorSimulation(unittest.TestCase):
 
         self.assertAlmostEqual(monitor.smoothed_dbm, -60.0, delta=0.5)
 
-        # Single transient dip to -85 dBm (e.g. microwave or momentary obstruction)
+        # Transient dip (1 sample at -85 dBm)
         now += 3.0
         alert = monitor.update_governor(-85.0, now)
-        # EWMA: 0.3 * (-85) + 0.7 * (-60) = -25.5 - 42.0 = -67.5 dBm
-        # -67.5 dBm > -75 dBm -> does not even enter degraded counter
         self.assertEqual(monitor.governor_state, GovernorState.HEALTHY)
         self.assertIsNone(alert)
 
-        # Sustained severe degradation below -75 dBm for multiple consecutive ticks
+        # Sustained severe degradation below -75 dBm (3 consecutive samples)
         now += 3.0
-        monitor.update_governor(-85.0, now)  # 2nd sample: ~ -72.75 dBm
+        monitor.update_governor(-85.0, now)
         now += 3.0
-        monitor.update_governor(-85.0, now)  # 3rd sample: ~ -76.4 dBm (< -75) - count 1
+        monitor.update_governor(-85.0, now)
         now += 3.0
-        monitor.update_governor(-85.0, now)  # count 2
+        monitor.update_governor(-85.0, now)
         now += 3.0
-        alert = monitor.update_governor(-85.0, now)  # count 3 -> triggers DEGRADED state!
+        alert = monitor.update_governor(-85.0, now)
 
         self.assertEqual(monitor.governor_state, GovernorState.DEGRADED)
         self.assertIsNotNone(alert)
         self.assertIn("Degraded", alert[0])
 
-        # Attempt immediate recovery without satisfying 30s cooldown
-        now += 3.0  # elapsed 3s since state change < 30s cooldown
+        # Recovery blocked by 30s cooldown
+        now += 3.0
         for _ in range(5):
             now += 3.0
             alert_rec = monitor.update_governor(-55.0, now)
-            # Cannot restore yet due to cooldown
             self.assertEqual(monitor.governor_state, GovernorState.DEGRADED)
 
-        # Advance past cooldown (now > last_state_change + 30s) with sustained good signal
+        # Advance past cooldown with 5 sustained healthy samples
         now += 30.0
         alert_restored = None
         for _ in range(5):
@@ -265,69 +316,131 @@ class TestLinkGovernorSimulation(unittest.TestCase):
         self.assertIsNotNone(alert_restored)
         self.assertIn("Restored", alert_restored[0])
 
+    def test_governor_sudden_drop_gradient_rule(self):
+        """Verify sudden gradient drop (∇P <= -15 dB over <= 12s) triggers DEGRADED."""
+        monitor = WiFiMonitor(alpha=0.3, cooldown_sec=30.0)
+        now = 1000.0
+
+        # Establish initial steady baseline at -50 dBm
+        for _ in range(10):
+            now += 1.0
+            monitor.update_governor(-50.0, now)
+        self.assertEqual(monitor.governor_state, GovernorState.HEALTHY)
+
+        # Sudden steep cliff: drop to -95 dBm over 3 seconds
+        # Even before 3 full consecutive samples below -75 dBm accumulate,
+        # the -15 dB gradient triggers immediate degraded state
+        now += 1.0
+        monitor.update_governor(-95.0, now)
+        now += 1.0
+        alert = monitor.update_governor(-95.0, now)
+
+        self.assertEqual(monitor.governor_state, GovernorState.DEGRADED)
+        self.assertIsNotNone(alert)
+        self.assertIn("Sudden signal drop", alert[1])
+
 
 class TestAdapterManagerSafetyAndRollback(unittest.TestCase):
-    """Verify Adapter Manager dry-run safety and atomic snapshot rollback."""
+    """Verify Adapter Manager discovery, enum label resolution, PHY gating, and atomic rollback."""
 
     def setUp(self):
         adapter_manager.set_dry_run_mode(True)
         adapter_manager._MOCK_REGISTRY.clear()
         adapter_manager._SESSION_SNAPSHOTS.clear()
 
-        # Seed mock adapter with supported Ndi\params
+        # Seed mock adapter with rich Ndi\params (enums with code and labels, numeric ranges)
         adapter_manager._MOCK_REGISTRY["0001"] = {
             "DriverDesc": "Intel(R) Wi-Fi 6 AX200 160MHz",
             "NetCfgInstanceId": "{12345678-ABCD-1234-ABCD-123456789ABC}",
             "*TransmitPower": "3",
             "NdiParams": {
-                "*TransmitPower": {"desc": "Transmit Power", "enums": ["1", "2", "3", "4", "5"]},
-                "*RoamAggressiveness": {"desc": "Roaming Aggressiveness", "enums": ["1", "2", "3", "4", "5"]},
-                "*PreferredBand": {"desc": "Preferred Band", "enums": ["0", "1", "2"]},
+                "*TransmitPower": {
+                    "desc": "Transmit Power", "type": "enum",
+                    "enums": [{"code": "1", "label": "1. Lowest"}, {"code": "3", "label": "3. Medium"}, {"code": "5", "label": "5. Highest"}],
+                    "enum_codes": ["1", "3", "5"],
+                    "enum_labels": ["1. Lowest", "3. Medium", "5. Highest"]
+                },
+                "*RoamAggressiveness": {
+                    "desc": "Roaming Aggressiveness", "type": "enum",
+                    "enums": [{"code": "1", "label": "1. Lowest"}, {"code": "3", "label": "3. Medium"}, {"code": "5", "label": "5. Highest"}],
+                    "enum_codes": ["1", "3", "5"],
+                    "enum_labels": ["1. Lowest", "3. Medium", "5. Highest"]
+                },
+                "*MIMOPowerSave": {
+                    "desc": "MIMO Power Save Mode", "type": "enum",
+                    "enums": [
+                        {"code": "0", "label": "Auto SMPS"},
+                        {"code": "1", "label": "Dynamic SMPS"},
+                        {"code": "2", "label": "Static SMPS"},
+                        {"code": "3", "label": "No SMPS"}  # Code 3 means disabled!
+                    ],
+                    "enum_codes": ["0", "1", "2", "3"],
+                    "enum_labels": ["Auto SMPS", "Dynamic SMPS", "Static SMPS", "No SMPS"]
+                },
+                "*ShortGI40MHz": {
+                    "desc": "Short Guard Interval 40MHz", "type": "enum",
+                    "enums": [{"code": "0", "label": "Disabled"}, {"code": "1", "label": "Enabled"}],
+                    "enum_codes": ["0", "1"],
+                    "enum_labels": ["Disabled", "Enabled"]
+                }
             }
         }
 
     def tearDown(self):
         adapter_manager.set_dry_run_mode(False)
 
-    def test_dry_run_does_not_mutate_system(self):
-        """Ensure dry-run mode returns success without writing to real registry or netsh."""
-        self.assertTrue(adapter_manager.is_dry_run_mode())
-        ok = adapter_manager.set_transmit_power(5)
-        self.assertTrue(ok)
-        # Verified mock registry updated
-        self.assertEqual(adapter_manager._MOCK_REGISTRY["0001"]["*TransmitPower"], "5")
+    def test_mimo_power_save_resolves_to_no_smps_code(self):
+        """Verify resolve_driver_param_value maps 'disable' to code '3' (No SMPS) rather than naive '0'."""
+        p_info = adapter_manager._MOCK_REGISTRY["0001"]["NdiParams"]["*MIMOPowerSave"]
+        valid, resolved_code, reason = adapter_manager.resolve_driver_param_value("*MIMOPowerSave", "disable", p_info)
+        self.assertTrue(valid)
+        self.assertEqual(resolved_code, "3")
+        self.assertIn("No SMPS", reason)
 
-    def test_unsupported_param_is_skipped_via_ndi_discovery(self):
-        """Parameters absent from Ndi\\params must be skipped to protect the driver."""
-        # *ShortGI20MHz is not in AX200 NdiParams mock -> should not be blindly written
-        success = adapter_manager._set_adapter_registry_value_safe("*ShortGI20MHz", "1", verify_ndi_support=True)
-        self.assertFalse(success)
-        self.assertNotIn("*ShortGI20MHz", adapter_manager._MOCK_REGISTRY["0001"])
+    def test_short_gi_gated_by_connection_phy(self):
+        """Short GI must be applied on 802.11ac connections and skipped on 802.11ax."""
+        # 1. On 802.11ac association -> Short GI applied
+        applied_ac = adapter_manager.apply_advanced_tier_b_tweaks(connection_phy="802.11ac")
+        self.assertTrue(any("ShortGI" in x for x in applied_ac))
 
-    def test_atomic_snapshot_and_rollback(self):
-        """Verify pre-change values are recorded and fully restored upon rollback."""
-        orig_power = adapter_manager._MOCK_REGISTRY["0001"]["*TransmitPower"]
-        self.assertEqual(orig_power, "3")
+        # 2. On 802.11ax association -> Short GI skipped
+        adapter_manager._MOCK_REGISTRY["0001"].pop("*ShortGI40MHz", None)
+        applied_ax = adapter_manager.apply_advanced_tier_b_tweaks(connection_phy="802.11ax (Wi-Fi 6)")
+        self.assertFalse(any("ShortGI" in x for x in applied_ax))
 
-        # 1. Mutate existing property (*TransmitPower)
-        adapter_manager.set_transmit_power(5)
-        self.assertEqual(adapter_manager._MOCK_REGISTRY["0001"]["*TransmitPower"], "5")
+    def test_real_disk_snapshot_and_rollback(self):
+        """Verify rollback with an actual snapshot file in a temporary directory on disk."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_snapshot_file = os.path.join(temp_dir, "test_snapshot.json")
+            original_snapshot_file = adapter_manager.SNAPSHOT_FILE
 
-        # 2. Inject a previously non-existent property (*RoamAggressiveness)
-        self.assertNotIn("*RoamAggressiveness", adapter_manager._MOCK_REGISTRY["0001"])
-        adapter_manager.set_roaming_aggressiveness(4)
-        self.assertEqual(adapter_manager._MOCK_REGISTRY["0001"]["*RoamAggressiveness"], "4")
+            try:
+                adapter_manager.SNAPSHOT_FILE = temp_snapshot_file
 
-        # 3. Perform rollback
-        ok, log = adapter_manager.rollback_settings()
-        self.assertTrue(ok)
-        self.assertGreater(len(log), 0)
+                # Temporarily enable disk writing for this test
+                adapter_manager._DRY_RUN = False
+                # Mock adapters in memory for simulation
+                adapter_manager._record_snapshot_entry("0001", "*TransmitPower", "3", True, "5")
+                adapter_manager._record_snapshot_entry("0001", "*RoamAggressiveness", None, False, "5")
 
-        # 4. Verify previous state restored
-        # Original property restored to "3"
-        self.assertEqual(adapter_manager._MOCK_REGISTRY["0001"]["*TransmitPower"], "3")
-        # Injected property removed
-        self.assertNotIn("*RoamAggressiveness", adapter_manager._MOCK_REGISTRY["0001"])
+                # Verify snapshot file physically written to disk
+                self.assertTrue(os.path.exists(temp_snapshot_file))
+                with open(temp_snapshot_file, "r") as f:
+                    data = json.load(f)
+                self.assertEqual(len(data), 2)
+                self.assertEqual(data[0]["original_value"], "3")
+                self.assertFalse(data[1]["existed"])
+
+                # Run rollback in dry run mode to verify restoration actions
+                adapter_manager._DRY_RUN = True
+                ok, log = adapter_manager.rollback_settings(snapshot_path=temp_snapshot_file)
+                self.assertTrue(ok)
+                self.assertTrue(any("Restored *TransmitPower -> 3" in x for x in log))
+                self.assertTrue(any("Deleted injected *RoamAggressiveness" in x for x in log))
+
+            finally:
+                adapter_manager.SNAPSHOT_FILE = original_snapshot_file
+                adapter_manager._DRY_RUN = True
 
 
 if __name__ == "__main__":

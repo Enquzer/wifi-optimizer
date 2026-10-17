@@ -149,20 +149,34 @@ class WiFiMonitor:
         else:
             self.smoothed_dbm = self.alpha * raw_dbm + (1.0 - self.alpha) * self.smoothed_dbm
 
+        # Track smoothed history for gradient drop evaluation (last 15s window)
+        if not hasattr(self, "_recent_smoothed"):
+            self._recent_smoothed = []
+        self._recent_smoothed.append((now, self.smoothed_dbm))
+        self._recent_smoothed = [(t, val) for t, val in self._recent_smoothed if now - t <= 15.0]
+
+        # Evaluate sudden gradient drop: delta <= -15.0 dB over <= 12 seconds
+        sudden_drop = False
+        if len(self._recent_smoothed) >= 2:
+            earliest_t, earliest_val = self._recent_smoothed[0]
+            if (now - earliest_t) <= 12.0 and (self.smoothed_dbm - earliest_val) <= -15.0:
+                sudden_drop = True
+
         alert = None
 
         if self.governor_state == GovernorState.HEALTHY:
-            if self.smoothed_dbm < -75.0:
+            if self.smoothed_dbm < -75.0 or sudden_drop:
                 self._degraded_counter += 1
                 self._healthy_counter = 0
-                if self._degraded_counter >= 3:
+                if self._degraded_counter >= 3 or sudden_drop:
                     if (now - self._last_state_change) >= self.cooldown_sec:
                         self.governor_state = GovernorState.DEGRADED
                         self._last_state_change = now
                         self._degraded_counter = 0
+                        reason = "Sudden signal drop (∇P <= -15 dB)" if sudden_drop else f"Smoothed signal degraded to {self.smoothed_dbm:.1f} dBm"
                         alert = (
                             "⚠️ WiFi Link Degraded",
-                            f"Smoothed signal degraded to {self.smoothed_dbm:.1f} dBm. Link margin is low."
+                            f"{reason}. Link margin is low."
                         )
             else:
                 self._degraded_counter = 0

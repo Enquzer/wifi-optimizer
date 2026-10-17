@@ -27,6 +27,8 @@ class OptimizationProfile:
     set_dns: bool
     dns_primary: str
     dns_secondary: str
+    allow_insecure_networks: bool = False  # Hard security gate: disallow Open and WEP
+    require_saved_profile: bool = False    # Roaming filter: only recommend networks already configured
 
 
 PROFILES = {
@@ -42,6 +44,8 @@ PROFILES = {
         set_dns=True,
         dns_primary="8.8.8.8",
         dns_secondary="8.8.4.4",
+        allow_insecure_networks=False,
+        require_saved_profile=False,
     ),
     "selfish": OptimizationProfile(
         name="Selfish Dominant",
@@ -55,6 +59,8 @@ PROFILES = {
         set_dns=True,
         dns_primary="1.1.1.1",
         dns_secondary="8.8.8.8",
+        allow_insecure_networks=False,
+        require_saved_profile=False,
     ),
     "max_range": OptimizationProfile(
         name="Max Range",
@@ -68,6 +74,8 @@ PROFILES = {
         set_dns=True,
         dns_primary="1.1.1.1",
         dns_secondary="1.0.0.1",
+        allow_insecure_networks=False,
+        require_saved_profile=False,
     ),
     "balanced": OptimizationProfile(
         name="Balanced",
@@ -81,6 +89,8 @@ PROFILES = {
         set_dns=True,
         dns_primary="1.1.1.1",
         dns_secondary="8.8.8.8",
+        allow_insecure_networks=False,
+        require_saved_profile=False,
     ),
     "power_save": OptimizationProfile(
         name="Power Saver",
@@ -94,6 +104,8 @@ PROFILES = {
         set_dns=False,
         dns_primary="8.8.8.8",
         dns_secondary="8.8.4.4",
+        allow_insecure_networks=False,
+        require_saved_profile=False,
     ),
 }
 
@@ -109,6 +121,9 @@ class NetworkScore:
     speed_score: float      # 0-20
     total_score: float      # 0-100
     recommendation: str
+    is_eligible: bool = True               # True security gate: False excludes AP from recommendation
+    ineligibility_reason: str = ""         # Reason if disqualified by policy
+
 
 
 @dataclass
@@ -165,11 +180,13 @@ def score_network(network: WiFiNetwork, congestion: dict,
                   profile: OptimizationProfile,
                   all_networks: Optional[List[WiFiNetwork]] = None,
                   adapter_info: Optional[AdapterInfo] = None,
-                  is_current_connected: bool = False) -> NetworkScore:
+                  is_current_connected: bool = False,
+                  saved_profiles: Optional[List[str]] = None,
+                  bss_load_utilization: float = 0.0) -> NetworkScore:
     """
-    Score a WiFi network using the corrected Multi-Objective BSSID Fitness Function (M-BFF).
+    Score a WiFi network using the Multi-Objective BSSID Fitness Function (M-BFF).
     S(N) = f_sig(P_rx) + f_cong(C) + f_band(B, P_rx) + f_phy(R) + f_sec(A)
-    Total score is normalized to [0, 100].
+    Includes hard security policy gating and saved profile filtering.
     """
     from core.wifi_scanner import calculate_effective_channel_congestion
 
@@ -178,18 +195,18 @@ def score_network(network: WiFiNetwork, congestion: dict,
     signal_score = max(0.0, min(30.0, signal_score))
 
     # 2. Channel Congestion Score (0-20 pts)
-    # Penalizes co-channel and adjacent-channel interference
+    # Penalizes co-channel and adjacent-channel interference scaled by BSS Load (u)
     if all_networks:
         c_eff = calculate_effective_channel_congestion(network, all_networks)
     else:
         # Fallback to simple channel count if full list not provided
         c_eff = max(0.0, float(congestion.get(network.channel, 1) - 1))
 
-    channel_score = max(0.0, 20.0 - 5.0 * c_eff)
+    u = max(0.0, min(1.0, bss_load_utilization))
+    channel_score = max(0.0, 20.0 - 5.0 * c_eff) * (1.0 - u)
     channel_score = max(0.0, min(20.0, channel_score))
 
     # 3. Band Matching Score (0-20 pts)
-    # Band weight g
     if profile.preferred_band == "5GHz" or profile.name == "Max Speed":
         g = 1.0 if network.band == "6GHz" else (0.95 if network.band == "5GHz" else 0.35)
     elif profile.preferred_band == "2.4GHz" or profile.name == "Max Range":
@@ -198,19 +215,20 @@ def score_network(network: WiFiNetwork, congestion: dict,
         g = 1.0 if network.band == "6GHz" else (0.9 if network.band == "5GHz" else 0.5)
 
     # Link margin distance attenuation factor h(P_rx)
-    # For high-frequency bands (5GHz/6GHz), link degrades faster through walls
     if network.band in ("5GHz", "6GHz"):
         h = max(0.1, min(1.0, (network.signal_dbm + 80.0) / 15.0))
     else:
-        # 2.4GHz penetrates obstacles reliably, but degrades as receiver sensitivity floor is approached
         h = max(0.1, min(1.0, (network.signal_dbm + 95.0) / 20.0))
 
     band_score = 20.0 * g * h
     band_score = max(0.0, min(20.0, band_score))
 
-    # 4. Security Score (0-10 pts)
+    # 4. Security Score (0-10 pts) and Security Policy Gating
     auth = network.authentication.lower()
     enc = network.encryption.lower()
+    is_open = ("open" in auth or auth == "")
+    is_wep = ("wep" in auth)
+
     if "wpa3" in auth:
         security_score = 10.0
     elif "wpa2" in auth or "wpa-2" in auth:
@@ -220,10 +238,26 @@ def score_network(network: WiFiNetwork, congestion: dict,
             security_score = 8.0
     elif "wpa" in auth:
         security_score = 3.0
-    elif "wep" in auth or "open" in auth or auth == "":
+    elif is_wep or is_open:
         security_score = 0.0
     else:
         security_score = 2.0
+
+    # Policy Gating
+    is_eligible = True
+    ineligibility_reason = ""
+
+    if (is_open or is_wep) and not profile.allow_insecure_networks:
+        is_eligible = False
+        ineligibility_reason = (
+            "Excluded by Security Policy: Plaintext Open network" if is_open
+            else "Excluded by Security Policy: Broken WEP RC4 cipher"
+        )
+
+    if profile.require_saved_profile and saved_profiles is not None:
+        if network.ssid not in saved_profiles:
+            is_eligible = False
+            ineligibility_reason = f"Excluded by Policy: SSID '{network.ssid}' is not in saved profiles."
 
     # 5. PHY / Radio Tech Score (0-20 pts)
     ap_phy = parse_radio_rank(network.radio_type)
@@ -238,8 +272,8 @@ def score_network(network: WiFiNetwork, congestion: dict,
     total = max(0.0, min(100.0, total))
 
     # Recommendation text
-    if security_score == 0.0 and ("open" in auth or "wep" in auth):
-        recommendation = "Insecure — Open/WEP network without hardware encryption"
+    if not is_eligible:
+        recommendation = f"Disqualified — {ineligibility_reason}"
     elif total >= 80:
         recommendation = "Excellent — optimal link margin and capacity"
     elif total >= 60:
@@ -261,6 +295,8 @@ def score_network(network: WiFiNetwork, congestion: dict,
         speed_score=round(speed_score, 2),
         total_score=round(total, 2),
         recommendation=recommendation,
+        is_eligible=is_eligible,
+        ineligibility_reason=ineligibility_reason,
     )
 
 
@@ -376,11 +412,16 @@ def run_optimization(profile_key: str = "balanced",
     congestion = get_channel_congestion(networks)
     _progress("📈 Analyzing channel congestion...")
 
-    # Score all networks with corrected M-BFF
-    scored = [score_network(n, congestion, profile, all_networks=networks, adapter_info=adapter_info) for n in networks]
-    scored.sort(key=lambda x: x.total_score, reverse=True)
+    from core.wifi_scanner import get_saved_wifi_profiles
+    saved_profiles = get_saved_wifi_profiles()
 
-    best = scored[0].network if scored else None
+    # Score all networks with corrected M-BFF and Security Gating
+    scored = [score_network(n, congestion, profile, all_networks=networks, adapter_info=adapter_info, saved_profiles=saved_profiles) for n in networks]
+    # Rank eligible networks first, then by total score
+    scored.sort(key=lambda x: (x.is_eligible, x.total_score), reverse=True)
+
+    eligible_candidates = [s for s in scored if s.is_eligible]
+    best = eligible_candidates[0].network if eligible_candidates else None
 
     recommendations = build_recommendations(adapter_info, networks, congestion)
 

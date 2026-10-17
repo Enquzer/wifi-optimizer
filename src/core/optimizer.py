@@ -126,108 +126,164 @@ class OptimizationResult:
     recommendations: List[str]
 
 
+def calculate_sig_score(dbm: float) -> float:
+    """
+    Sigmoid curve for signal strength score (0-30 pts):
+    f_sig(P_rx) = 30 / (1 + exp(-0.35 * (P_rx + 72)))
+    Inflection point at -72 dBm (15 pts).
+    Near saturation at >= -55 dBm (~30 pts).
+    Steep cliff below -75 dBm down to ~0.05 pts at -90 dBm.
+    """
+    try:
+        exp_val = math.exp(-0.35 * (dbm + 72.0))
+        return 30.0 / (1.0 + exp_val)
+    except OverflowError:
+        return 0.0 if dbm < -72.0 else 30.0
+
+
+def parse_radio_rank(radio_str: str) -> float:
+    """Map radio type string to PHY score (0-20 pts)."""
+    r = radio_str.lower()
+    if "802.11be" in r or "wi-fi 7" in r or "wifi 7" in r:
+        return 20.0
+    if "802.11ax" in r or "wi-fi 6" in r or "wifi 6" in r or "wi-fi6" in r:
+        return 18.0
+    if "802.11ac" in r or "wi-fi 5" in r or "wifi 5" in r:
+        return 14.0
+    if "802.11n" in r or "wi-fi 4" in r or "wifi 4" in r:
+        return 9.0
+    if "802.11g" in r:
+        return 4.0
+    if "802.11a" in r:
+        return 4.0
+    if "802.11b" in r:
+        return 1.0
+    return 7.0
+
+
 def score_network(network: WiFiNetwork, congestion: dict,
-                  profile: OptimizationProfile) -> NetworkScore:
+                  profile: OptimizationProfile,
+                  all_networks: Optional[List[WiFiNetwork]] = None,
+                  adapter_info: Optional[AdapterInfo] = None,
+                  is_current_connected: bool = False) -> NetworkScore:
     """
-    Score a WiFi network based on multiple factors.
-    Returns a NetworkScore with breakdown.
+    Score a WiFi network using the corrected Multi-Objective BSSID Fitness Function (M-BFF).
+    S(N) = f_sig(P_rx) + f_cong(C) + f_band(B, P_rx) + f_phy(R) + f_sec(A)
+    Total score is normalized to [0, 100].
     """
-    # 1. Signal Strength Score (0-30 pts)
-    # Excellent: > -60 dBm = 30pts, Good: -60 to -70 = 20pts, Fair: -70 to -80 = 10pts, Poor < -80 = 5pts
-    dbm = network.signal_dbm
-    if dbm >= -55:
-        signal_score = 30.0
-    elif dbm >= -65:
-        signal_score = 25.0 + (dbm + 65) * 0.5
-    elif dbm >= -75:
-        signal_score = 15.0 + (dbm + 75) * 1.0
-    elif dbm >= -85:
-        signal_score = 5.0 + (dbm + 85) * 1.0
-    else:
-        signal_score = max(0.0, 5.0 + (dbm + 85))
+    from core.wifi_scanner import calculate_effective_channel_congestion
+
+    # 1. Signal Strength Score (0-30 pts) - Continuous Sigmoid
+    signal_score = calculate_sig_score(network.signal_dbm)
+    signal_score = max(0.0, min(30.0, signal_score))
 
     # 2. Channel Congestion Score (0-20 pts)
-    ch_count = congestion.get(network.channel, 0)
-    if ch_count <= 1:
-        channel_score = 20.0
-    elif ch_count == 2:
-        channel_score = 15.0
-    elif ch_count == 3:
-        channel_score = 10.0
-    elif ch_count <= 5:
-        channel_score = 5.0
+    # Penalizes co-channel and adjacent-channel interference
+    if all_networks:
+        c_eff = calculate_effective_channel_congestion(network, all_networks)
     else:
-        channel_score = 1.0
+        # Fallback to simple channel count if full list not provided
+        c_eff = max(0.0, float(congestion.get(network.channel, 1) - 1))
 
-    # 3. Band Score (0-20 pts)
-    if profile.preferred_band == "5GHz":
-        band_score = 20.0 if network.band == "5GHz" else (
-            5.0 if network.band == "2.4GHz" else 10.0)
-    elif profile.preferred_band == "2.4GHz":
-        band_score = 20.0 if network.band == "2.4GHz" else 8.0
-    else:  # Auto
-        band_score = 15.0 if network.band == "5GHz" else 10.0
+    channel_score = max(0.0, 20.0 - 5.0 * c_eff)
+    channel_score = max(0.0, min(20.0, channel_score))
 
-    # 6GHz bonus
-    if network.band == "6GHz":
-        band_score = 20.0
+    # 3. Band Matching Score (0-20 pts)
+    # Band weight g
+    if profile.preferred_band == "5GHz" or profile.name == "Max Speed":
+        g = 1.0 if network.band == "6GHz" else (0.95 if network.band == "5GHz" else 0.35)
+    elif profile.preferred_band == "2.4GHz" or profile.name == "Max Range":
+        g = 1.0 if network.band == "2.4GHz" else (0.6 if network.band == "5GHz" else 0.5)
+    else:  # Balanced / Selfish / Auto
+        g = 1.0 if network.band == "6GHz" else (0.9 if network.band == "5GHz" else 0.5)
+
+    # Link margin distance attenuation factor h(P_rx)
+    # For high-frequency bands (5GHz/6GHz), link degrades faster through walls
+    if network.band in ("5GHz", "6GHz"):
+        h = max(0.1, min(1.0, (network.signal_dbm + 80.0) / 15.0))
+    else:
+        # 2.4GHz penetrates obstacles reliably, but degrades as receiver sensitivity floor is approached
+        h = max(0.1, min(1.0, (network.signal_dbm + 95.0) / 20.0))
+
+    band_score = 20.0 * g * h
+    band_score = max(0.0, min(20.0, band_score))
 
     # 4. Security Score (0-10 pts)
     auth = network.authentication.lower()
+    enc = network.encryption.lower()
     if "wpa3" in auth:
         security_score = 10.0
     elif "wpa2" in auth or "wpa-2" in auth:
-        security_score = 8.0
+        if "tkip" in enc:
+            security_score = 3.0
+        else:
+            security_score = 8.0
     elif "wpa" in auth:
-        security_score = 5.0
-    elif "open" in auth or auth == "":
-        security_score = 1.0
-    else:
         security_score = 3.0
-
-    # 5. Speed / Radio Type Score (0-20 pts)
-    radio = network.radio_type.lower()
-    if "802.11ax" in radio or "wi-fi 6" in radio or "wi-fi6" in radio:
-        speed_score = 20.0
-    elif "802.11ac" in radio or "wi-fi 5" in radio:
-        speed_score = 16.0
-    elif "802.11n" in radio or "wi-fi 4" in radio:
-        speed_score = 10.0
-    elif "802.11g" in radio:
-        speed_score = 6.0
-    elif "802.11a" in radio:
-        speed_score = 4.0
-    elif "802.11b" in radio:
-        speed_score = 2.0
+    elif "wep" in auth or "open" in auth or auth == "":
+        security_score = 0.0
     else:
-        # Default based on band
-        speed_score = 12.0 if network.band == "5GHz" else 7.0
+        security_score = 2.0
+
+    # 5. PHY / Radio Tech Score (0-20 pts)
+    ap_phy = parse_radio_rank(network.radio_type)
+    if adapter_info and adapter_info.radio_type:
+        adapter_phy = parse_radio_rank(adapter_info.radio_type)
+        speed_score = min(ap_phy, adapter_phy)
+    else:
+        speed_score = ap_phy
+    speed_score = max(0.0, min(20.0, speed_score))
 
     total = signal_score + channel_score + band_score + security_score + speed_score
+    total = max(0.0, min(100.0, total))
 
     # Recommendation text
-    if total >= 80:
-        recommendation = "Excellent — optimal connection"
+    if security_score == 0.0 and ("open" in auth or "wep" in auth):
+        recommendation = "Insecure — Open/WEP network without hardware encryption"
+    elif total >= 80:
+        recommendation = "Excellent — optimal link margin and capacity"
     elif total >= 60:
-        recommendation = "Good — strong connection"
+        recommendation = "Good — stable connection"
     elif total >= 40:
-        recommendation = "Fair — acceptable connection"
+        recommendation = "Fair — acceptable link margin"
     elif total >= 20:
-        recommendation = "Weak — consider moving closer"
+        recommendation = "Weak — high retransmission probability"
     else:
-        recommendation = "Poor — very weak signal"
+        recommendation = "Poor — marginal link near sensitivity threshold"
 
-    network.score = total
+    network.score = round(total, 2)
     return NetworkScore(
         network=network,
-        signal_score=signal_score,
-        channel_score=channel_score,
-        band_score=band_score,
-        security_score=security_score,
-        speed_score=speed_score,
-        total_score=total,
+        signal_score=round(signal_score, 2),
+        channel_score=round(channel_score, 2),
+        band_score=round(band_score, 2),
+        security_score=round(security_score, 2),
+        speed_score=round(speed_score, 2),
+        total_score=round(total, 2),
         recommendation=recommendation,
     )
+
+
+def should_roam_decision(current_score: float, candidate_score: float,
+                         last_roam_timestamp: float, current_timestamp: float,
+                         hysteresis_threshold: float = 10.0,
+                         cooldown_sec: float = 30.0) -> tuple[bool, str]:
+    """
+    Hysteresis and cooldown gate for AP selection:
+    Prevents ping-pong / flapping across adjacent BSSIDs.
+    - Requires candidate score > current score + hysteresis_threshold
+    - Requires elapsed time >= cooldown_sec
+    """
+    elapsed = current_timestamp - last_roam_timestamp
+    if elapsed < cooldown_sec:
+        return False, f"Cooldown active ({cooldown_sec - elapsed:.1f}s remaining)"
+
+    delta = candidate_score - current_score
+    if delta < hysteresis_threshold:
+        return False, f"Delta {delta:.1f} pts below hysteresis margin (+{hysteresis_threshold:.1f} pts required)"
+
+    return True, f"Eligible: Candidate exceeds current link by {delta:.1f} pts"
+
 
 
 def auto_select_profile(adapter_info: Optional[AdapterInfo],
@@ -320,8 +376,8 @@ def run_optimization(profile_key: str = "balanced",
     congestion = get_channel_congestion(networks)
     _progress("📈 Analyzing channel congestion...")
 
-    # Score all networks
-    scored = [score_network(n, congestion, profile) for n in networks]
+    # Score all networks with corrected M-BFF
+    scored = [score_network(n, congestion, profile, all_networks=networks, adapter_info=adapter_info) for n in networks]
     scored.sort(key=lambda x: x.total_score, reverse=True)
 
     best = scored[0].network if scored else None

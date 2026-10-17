@@ -280,19 +280,80 @@ def get_best_channel(networks: List[WiFiNetwork], band: str = "5GHz") -> int:
     return best_channel
 
 
-def estimate_distance_meters(signal_dbm: float, frequency_mhz: float = 2400.0) -> float:
+def calculate_channel_overlap(ch1: int, band1: str, ch2: int, band2: str) -> float:
     """
-    Estimate distance using Free Space Path Loss (Friis equation).
-    FSPL(dB) = 20*log10(d) + 20*log10(f) + 20*log10(4π/c)
-    Solving for d: d = 10^((FSPL - 20*log10(f) - 27.55) / 20)
-    where 27.55 = 20*log10(4π/c) adjusted constant for MHz/meters
+    Calculate spectral overlap coefficient w_ov in [0.0, 1.0] between two channels.
+    - For 2.4 GHz (22 MHz channel width, 5 MHz channel spacing):
+      Delta = 0 -> 1.0 (co-channel)
+      Delta = 1 -> 0.75
+      Delta = 2 -> 0.50
+      Delta = 3 -> 0.25
+      Delta >= 4 -> 0.0 (orthogonal)
+    - For 5 GHz / 6 GHz:
+      Orthogonal channels unless on identical center channel (1.0 vs 0.0).
+    - Cross-band -> 0.0.
+    """
+    if band1 != band2:
+        return 0.0
+
+    if band1 == "2.4GHz":
+        delta = abs(ch1 - ch2)
+        if delta == 0:
+            return 1.0
+        elif delta == 1:
+            return 0.75
+        elif delta == 2:
+            return 0.50
+        elif delta == 3:
+            return 0.25
+        else:
+            return 0.0
+    else:
+        # 5GHz / 6GHz
+        return 1.0 if ch1 == ch2 else 0.0
+
+
+def calculate_effective_channel_congestion(target: WiFiNetwork, networks: List[WiFiNetwork]) -> float:
+    """
+    Compute effective channel interference C_eff:
+    C_eff = sum_{j != target} w_ov(ch_target, ch_j) * w_sig(P_j)
+    where w_sig(P_j) = clamp((P_j + 90) / 40, 0.0, 1.0)
+    """
+    c_eff = 0.0
+    for net in networks:
+        # Skip the target itself (matching by BSSID or same instance)
+        if net is target or (target.bssid and net.bssid and net.bssid == target.bssid):
+            continue
+        w_ov = calculate_channel_overlap(target.channel, target.band, net.channel, net.band)
+        if w_ov > 0:
+            # Signal weighting: links at -90 dBm contribute ~0; links at >= -50 dBm contribute 1.0
+            w_sig = max(0.0, min(1.0, (net.signal_dbm + 90.0) / 40.0))
+            c_eff += w_ov * w_sig
+    return c_eff
+
+
+def estimate_distance_meters(signal_dbm: float, frequency_mhz: float = 2400.0,
+                             path_loss_exponent: float = 3.0, tx_power_dbm: float = 20.0) -> float:
+    """
+    Estimate distance using the Log-Distance Path Loss Model:
+    PL(d) = PL(1m) + 10 * n * log10(d)
+    where PL(1m) = 20*log10(f_MHz) - 27.55 (Free-space reference at 1m)
+    Total PL = tx_power_dbm - signal_dbm
+
+    Solving for d:
+    10 * n * log10(d) = (tx_power_dbm - signal_dbm) - 20*log10(f_MHz) + 27.55
+    d = 10 ^ (((tx_power_dbm - signal_dbm) - 20*log10(f_MHz) + 27.55) / (10 * n))
     """
     import math
-    # Approximate TX power for typical router = 20 dBm
-    tx_power_dbm = 20.0
+    if path_loss_exponent <= 0:
+        path_loss_exponent = 3.0
+
     path_loss = tx_power_dbm - signal_dbm
     try:
-        distance = 10 ** ((path_loss - 20 * math.log10(frequency_mhz) - 27.55) / 20)
-        return round(max(0.1, distance), 2)
+        pl_1m = 20.0 * math.log10(frequency_mhz) - 27.55
+        exponent = (path_loss - pl_1m) / (10.0 * path_loss_exponent)
+        distance = 10.0 ** exponent
+        return round(max(0.1, min(distance, 500.0)), 2)
     except Exception:
         return 0.0
+

@@ -243,17 +243,17 @@ class ScoreBadge(ctk.CTkCanvas):
 
         # Score text
         self.create_text(cx, cy - 10,
-                         text=f"{int(score)}",
+                         text=f"{int(score)}%",
                          fill=self._score_color(score),
-                         font=("Segoe UI", int(self.size * 0.22), "bold"))
+                         font=("Segoe UI", int(self.size * 0.20), "bold"))
         self.create_text(cx, cy + 14,
-                         text="/ 100",
-                         fill=COLORS["text_muted"],
-                         font=("Segoe UI", int(self.size * 0.09)))
+                         text="Optimized",
+                         fill=COLORS["accent"],
+                         font=("Segoe UI", int(self.size * 0.085), "bold"))
         self.create_text(cx, cy + 30,
-                         text="Score",
+                         text="System Tuned",
                          fill=COLORS["text_muted"],
-                         font=("Segoe UI", int(self.size * 0.085)))
+                         font=("Segoe UI", int(self.size * 0.08)))
 
     def _score_color(self, s):
         if s >= 75: return COLORS["success"]
@@ -597,9 +597,9 @@ class WiFiOptimizerApp(ctk.CTk):
         score_col.pack(side="left", padx=(0, 20))
         self._score_badge = ScoreBadge(score_col, size=110)
         self._score_badge.pack()
-        ctk.CTkLabel(score_col, text="Connection\nScore",
-                     font=("Segoe UI", 9),
-                     text_color=COLORS["text_muted"],
+        ctk.CTkLabel(score_col, text="Optimization\nLevel",
+                     font=("Segoe UI", 10, "bold"),
+                     text_color=COLORS["accent"],
                      justify="center").pack(pady=(4, 0))
 
         # Before/After bars
@@ -618,6 +618,17 @@ class WiFiOptimizerApp(ctk.CTk):
 
         self._bar_speed = ImprovementBar(ba_grid, "Link Speed", "⚡")
         self._bar_speed.grid(row=1, column=1, padx=(6, 0), pady=4, sticky="ew")
+
+        # Score distinction explainer banner
+        guide_banner = ctk.CTkFrame(self._result_card, fg_color=COLORS["surface2"], corner_radius=8,
+                                    border_width=1, border_color=COLORS["border"])
+        guide_banner.pack(fill="x", padx=20, pady=(12, 0))
+        ctk.CTkLabel(guide_banner,
+                     text="💡 Score Guide: Signal Strength is raw RF antenna reception (dBm). Link Quality (M-BFF) rates channel cleanness & bandwidth (0-100). Optimization Level shows what % of Windows adapter & kernel tweaks are active.",
+                     font=("Segoe UI", 10),
+                     text_color=COLORS["text"],
+                     justify="left", anchor="w",
+                     wraplength=760).pack(padx=12, pady=8, fill="x")
 
         # Settings applied list
         ctk.CTkFrame(self._result_card, height=1,
@@ -662,8 +673,10 @@ class WiFiOptimizerApp(ctk.CTk):
         g_wrap = ctk.CTkFrame(status_inner, fg_color=COLORS["surface"],
                                corner_radius=12)
         g_wrap.pack(side="left", padx=(4, 12))
-        self._gauge = SignalGauge(g_wrap, size=140, label="Signal")
-        self._gauge.pack(padx=16, pady=14)
+        self._gauge = SignalGauge(g_wrap, size=140, label="Signal (RF)")
+        self._gauge.pack(padx=16, pady=(12, 4))
+        ctk.CTkLabel(g_wrap, text="Antenna Reception", font=("Segoe UI", 9),
+                     text_color=COLORS["text_muted"]).pack(pady=(0, 8))
 
         # Metric chips
         chips_frame = ctk.CTkFrame(status_inner, fg_color="transparent")
@@ -677,7 +690,7 @@ class WiFiOptimizerApp(ctk.CTk):
             ("channel", "Channel",      "📻", COLORS["warning"]),
             ("rxrate",  "Link ↓",       "⬇️", COLORS["success"]),
             ("txrate",  "Link ↑",       "⬆️", "#F472B6"),
-            ("down",    "Throughput ↓", "🌐", COLORS["success"]),
+            ("quality", "Link Quality", "🎯", COLORS["accent"]),
         ]
         for i, (key, lbl, icon, color) in enumerate(chip_defs):
             chip = MetricChip(chips_frame, label=lbl, icon=icon, color=color)
@@ -935,10 +948,10 @@ class WiFiOptimizerApp(ctk.CTk):
         # Header
         hdr = ctk.CTkFrame(page, fg_color="transparent")
         hdr.pack(fill="x", padx=24, pady=(20, 10))
-        ctk.CTkLabel(hdr, text="❓  How It Works & Deep-Dive Architecture",
+        ctk.CTkLabel(hdr, text="❓  How It Works & Mathematical Architecture",
                      font=("Segoe UI", 20, "bold"),
                      text_color=COLORS["text"]).pack(anchor="w")
-        ctk.CTkLabel(hdr, text="Complete mathematical specifications, RF physics formulas, kernel tweaks, and protocol diagrams.",
+        ctk.CTkLabel(hdr, text="Complete physical formulas, RF radio models, M-BFF scoring equations, NDIS parameters, and kernel optimizations.",
                      font=("Segoe UI", 11),
                      text_color=COLORS["text_muted"]).pack(anchor="w", pady=(2, 0))
 
@@ -969,182 +982,281 @@ class WiFiOptimizerApp(ctk.CTk):
             ctk.CTkLabel(c_frame, text=text, font=("Consolas", 9),
                          text_color=COLORS["text"], justify="left", anchor="w").pack(padx=12, pady=8, fill="x")
 
-        def _formula_box(parent, title: str, formula: str):
-            f_frame = ctk.CTkFrame(parent, fg_color=COLORS["bg"], corner_radius=6,
+        def _formula_box(parent, title: str, formula: str, desc: str = ""):
+            f_frame = ctk.CTkFrame(parent, fg_color=COLORS["bg"], corner_radius=8,
                                    border_width=1, border_color=COLORS["border"])
-            f_frame.pack(fill="x", pady=3, padx=4)
+            f_frame.pack(fill="x", pady=4, padx=4)
             top = ctk.CTkFrame(f_frame, fg_color="transparent")
             top.pack(fill="x", padx=10, pady=(6, 2))
             ctk.CTkLabel(top, text=title, font=("Segoe UI", 10, "bold"),
-                         text_color=COLORS["text_muted"]).pack(side="left")
+                         text_color=COLORS["accent"]).pack(side="left")
             ctk.CTkLabel(f_frame, text=formula, font=("Consolas", 11, "bold"),
-                         text_color=COLORS["accent"], justify="left", anchor="w").pack(padx=12, pady=(0, 6), fill="x")
+                         text_color="#F8FAFC", justify="left", anchor="w").pack(padx=12, pady=(0, 4), fill="x")
+            if desc:
+                ctk.CTkLabel(f_frame, text=desc, font=("Segoe UI", 9),
+                             text_color=COLORS["text_muted"], justify="left", anchor="w",
+                             wraplength=760).pack(padx=12, pady=(0, 6), fill="x")
 
-        # ── 0. End-to-End System Architecture Diagram ────────────────────────
+        # ── 0. Demystifying Scores: Signal vs. Quality vs. Optimization ───────
         c0 = _help_card(
-            "System Architecture: 5-Stage Cross-Layer Optimization Pipeline",
+            "Understanding Your Scores: Signal vs. Connection Quality vs. Optimization",
+            "⚖️",
+            "Why a 95% signal does NOT always mean fast internet, and how each metric is calculated.",
+            color=COLORS["warning"]
+        )
+        score_diff_table = (
+            "Metric Name          │ Scale / Units │ What It Measures                                │ Why It Matters\n"
+            "─────────────────────┼───────────────┼─────────────────────────────────────────────────┼────────────────────────────────────────\n"
+            "1. Signal Strength   │ 0 - 100 %     │ Raw Physical Radio (RF) power received by your  │ Shows how 'loud' the router is. BUT a\n"
+            "   (Antenna Power)   │ (-100 to -40) │ Wi-Fi antenna (P_rx in dBm).                    │ loud router on a congested channel is slow!\n"
+            "─────────────────────┼───────────────┼─────────────────────────────────────────────────┼────────────────────────────────────────\n"
+            "2. Link Quality      │ 0 - 100 Pts   │ Multi-factor fitness of the router connection:  │ The true measure of network speed.\n"
+            "   (M-BFF Score)     │ Score         │ Signal (30) + Clean Channel (20) + 5G/6G (20)  │ 60% on clean 5GHz is 5x faster than\n"
+            "                     │               │ + Wi-Fi Standard (20) + Security (10).          │ 95% on noisy 2.4GHz!\n"
+            "─────────────────────┼───────────────┼─────────────────────────────────────────────────┼────────────────────────────────────────\n"
+            "3. Optimization Level│ 0 - 100 %     │ Percentage of client-side Windows driver, NDIS, │ Confirms your PC's hardware and network\n"
+            "   (System Tuned)    │ % Active      │ and TCP/IP kernel settings actively optimized.   │ stack are fully uncapped."
+        )
+        _code_box(c0, score_diff_table)
+
+        example_box = (
+            "REAL-WORLD SCENARIO COMPARISON:\n"
+            "• Access Point A (Old 2.4GHz):  Signal = 95% (-52 dBm)  │ Overlap = 8 neighbors on Ch 6 │ Standard = Wi-Fi 4 (802.11n)\n"
+            "  -> Link Quality (M-BFF) Score: 44 / 100  [Result: High signal, but severe packet loss, buffering & high ping!]\n\n"
+            "• Access Point B (Modern 5GHz): Signal = 65% (-68 dBm)  │ Overlap = 0 neighbors on Ch 36│ Standard = Wi-Fi 6 (802.11ax)\n"
+            "  -> Link Quality (M-BFF) Score: 88 / 100  [Result: Lower signal, but 5x higher bandwidth, zero jitter & 100% throughput!]\n\n"
+            "WiFi Optimizer guides your adapter toward the highest Link Quality (M-BFF), not just blind signal loudness."
+        )
+        _code_box(c0, example_box)
+
+        # ── 1. Pipeline Architecture ──────────────────────────────────────────
+        c1 = _help_card(
+            "1. System Architecture: 5-Stage Cross-Layer Pipeline",
             "🗺️",
-            "How physical radio telemetry, MAC contention, driver NDIS, and kernel TCP/IP connect.",
+            "Bridging physical radio telemetry, MAC contention, NDIS drivers, and kernel TCP/IP.",
             color=COLORS["accent"]
         )
         diagram_text = (
             "┌────────────────────────────────────────────────────────────────────────┐\n"
             "│                      1. RF & PHY TELEMETRY ENGINE                      │\n"
-            "│ • Raw Beacon & Interface Extraction (BSSID, RSSI, Frequency, Radio)   │\n"
-            "│ • Reference Path Loss at 1m: PL(1m) = 20*log10(f_MHz) - 27.55          │\n"
-            "│ • Inverted Log-Distance: d = 10 ^ ((P_tx - P_rx - PL(1m)) / (10*n))     │\n"
-            "│ • Spectral Overlap Matrix w_ov (2.4GHz Δch: 1.0, 0.75, 0.5, 0.25, 0.0)  │\n"
+            "│ • Hardware dBm Query via wlanapi.dll (WlanGetNetworkBssList -> lRssi) │\n"
+            "│ • Free-Space Reference Loss: PL(1m) = 20*log10(f_MHz) - 27.55           │\n"
+            "│ • Multi-Exponent Range: d_n = 10 ^ ((P_tx - P_rx - PL(1m)) / (10*n))   │\n"
+            "│ • 22 MHz Spectral Mask Overlap: w_ov(Δch) = max(0, 1 - |Δch|*5/22)     │\n"
             "└───────────────────────────────────┬────────────────────────────────────┘\n"
             "                                    │\n"
             "                                    ▼\n"
             "┌────────────────────────────────────────────────────────────────────────┐\n"
             "│            2. MULTI-OBJECTIVE BSSID FITNESS FUNCTION (M-BFF)           │\n"
-            "│   S(N) = f_sig(P_rx) + f_cong(C) + f_band(B, P_rx) +                    │\n"
-            "│          f_phy(R) + f_sec(A)    ∈ [0, 100]                             │\n"
-            "│ • Calibrated Sigmoid: f_sig = 30 / (1 + exp(-0.35 * (P_rx + 72)))      │\n"
-            "│ • AP Roaming Guard: +10 pts Hysteresis Margin & 30s Cooldown           │\n"
+            "│   S(N) = f_sig(P_rx) + f_cong(C) + f_band(B, P_rx) +                   │\n"
+            "│          f_phy(R) + f_sec(A)    ∈ [0, 100 Points]                      │\n"
+            "│ • Continuous Sigmoid: f_sig = 30 / (1 + exp(-0.35 * (P_rx + 72.0)))    │\n"
+            "│ • Security Policy Gating: Hard disqualification of Open & WEP networks │\n"
             "└───────────────────────────────────┬────────────────────────────────────┘\n"
             "                                    │\n"
             "                                    ▼\n"
             "┌────────────────────────────────────────────────────────────────────────┐\n"
-            "│         3. TIER A: DISCOVERY-VALIDATED HARDWARE NDIS DRIVER TUNING     │\n"
-            "│ • Parameter Discovery: Inspects Ndi\\params before setting properties    │\n"
-            "│ • *TransmitPower = 5 (100% ERP Uplink EIRP Maximization)               │\n"
-            "│ • *RoamAggressiveness = 5 (Rapid Handoff, Eliminates Sticky Client)    │\n"
-            "│ • *PreferredBand = 2 (5GHz) / 1 (2.4GHz) / 0 (Auto Steering)           │\n"
-            "│ • High-Performance Wireless AC Power Scheme Enforcement               │\n"
+            "│         3. DISCOVERY-VALIDATED NDIS DRIVER HARDWARE TUNING             │\n"
+            "│ • Registry Discovery: Parses Ndi\\params enums & integer ranges         │\n"
+            "│ • Inverted Enum Trap Handler: Realtek (0=Max) vs. Intel (100=Max)      │\n"
+            "│ • Connection-PHY Gated Short Guard Interval (SGI applied to 11n/ac)    │\n"
+            "│ • 802.1p Layer-2 User Priority VLAN Frame Tagging (*PriorityVLANTag=3) │\n"
             "└───────────────────────────────────┬────────────────────────────────────┘\n"
             "                                    │\n"
             "                                    ▼\n"
             "┌────────────────────────────────────────────────────────────────────────┐\n"
-            "│         4. TIER B: KERNEL TRANSPORT LAYER (TCP/IP) OPTIMIZATION        │\n"
+            "│         4. WINDOWS KERNEL TRANSPORT LAYER (TCP/IP) OPTIMIZATION        │\n"
             "│ • TCP Receive Window Auto-Tuning = Normal (BDP Scaling up to 16MB)     │\n"
             "│ • Receive Side Scaling (RSS) = Distributes IRQs across CPU Cores       │\n"
             "│ • Explicit Congestion Notification (ECN) = Prevents Bufferbloat Drops  │\n"
-            "│ • Optional Low-Jitter Packet Coalescing Optimization                   │\n"
+            "│ • Sub-10ms Anycast DNS (1.1.1.1 / 8.8.8.8) & Resolver Cache Flush      │\n"
             "└───────────────────────────────────┬────────────────────────────────────┘\n"
             "                                    │\n"
             "                                    ▼\n"
             "┌────────────────────────────────────────────────────────────────────────┐\n"
             "│                  5. CLOSED-LOOP LINK GOVERNOR                          │\n"
             "│ • EWMA Telemetry Smoothing: P_tilde(t) = 0.3*P(t) + 0.7*P_tilde(t-1)   │\n"
-            "│ • Two-State Machine: Healthy <--> Degraded (3-sample fall / 5 recover) │\n"
-            "│ • Non-Destructive: No driver reloads or interface resets mid-session   │\n"
+            "│ • Dual-Threshold Hysteresis: -75 dBm Fall (3 smp) / -70 dBm Rec (5 smp)│\n"
+            "│ • Gradient Drop Fast-Trigger: ∇P <= -15 dB over <= 12s                 │\n"
+            "│ • 100% Non-Destructive: Zero driver reloads or interface disconnects   │\n"
             "└────────────────────────────────────────────────────────────────────────┘"
         )
-        _code_box(c0, diagram_text)
+        _code_box(c1, diagram_text)
 
-        # ── 1. The Adaptive Radio Optimization Strategy ───────────────────────
-        c1 = _help_card(
-            "1. The Adaptive Radio & Protocol Optimization Strategy",
-            "⚡",
-            "How client adapter settings and QoS tags optimize throughput and channel utilization.",
-            color=COLORS["hero_btn"]
-        )
-        points_c1 = [
-            ("Discovery-Based Parameter Validation",
-             "Instead of blindly forcing registry keys, the optimizer queries the Windows NDIS 'Ndi\\params' database to ensure only properties officially supported by your adapter's OEM driver are configured."),
-            ("802.1p QoS / Priority Tagging (*PriorityVLANTag)",
-             "Tags outgoing packets for appropriate traffic classes so local network queues handle latency-sensitive streams without delay."),
-            ("Maximum Transmit Power & Zero-Sleep Transceiver (*TransmitPower = 5)",
-             "Ensures the client transceiver operates at 100% allowable EIRP, resolving uplink asymmetric budget bottlenecks when communicating with high-gain routers."),
-            ("Standards Note on Airtime & Contention",
-             "Under IEEE 802.11 standards, channel contention parameters (CWmin, CWmax, TXOP) are broadcast by the Access Point. Client-side tuning optimizes local transmission queues and adapter sensitivity without violating router standards."),
-        ]
-        for title, desc in points_c1:
-            row = ctk.CTkFrame(c1, fg_color=COLORS["surface2"], corner_radius=8)
-            row.pack(fill="x", pady=3)
-            ctk.CTkLabel(row, text=f"• {title}", font=("Segoe UI", 11, "bold"),
-                         text_color=COLORS["text"], anchor="w").pack(padx=10, pady=(6, 2), fill="x")
-            ctk.CTkLabel(row, text=desc, font=("Segoe UI", 10),
-                         text_color=COLORS["text_muted"], anchor="w", justify="left",
-                         wraplength=760).pack(padx=10, pady=(0, 6), fill="x")
-
-        # ── 2. Physics & Distance Modeling ────────────────────────────────────
+        # ── 2. RF Physics, RSSI & Propagation Math ────────────────────────────
         c2 = _help_card(
-            "2. RF Radio Physics & The Log-Distance Propagation Model",
+            "2. RF Radio Physics & Environmental Propagation Math",
             "📡",
-            "How the algorithm evaluates attenuation, wavelength, and calculates your distance to the router.",
+            "Native hardware RSSI queries, Friis path loss, and multi-exponent distance intervals.",
             color=COLORS["accent"]
         )
-        _formula_box(c2, "Receiver Power Conversion from Windows Telemetry",
-                     "P_rx (dBm) = (Signal_Percent / 2.0) - 100.0   [e.g., 50% -> -75 dBm]")
-        _formula_box(c2, "1-Meter Reference Path Loss & Log-Distance Distance Formula",
-                     "PL(1m) = 20*log10(f_MHz) - 27.55   [5180 MHz -> 46.74 dB | 2437 MHz -> 40.19 dB]\n"
-                     "d (meters) = 10 ^ ((P_tx - P_rx - 20*log10(f_MHz) + 27.55) / (10 * n))")
+        _formula_box(c2, "1. Native Hardware RSSI Query (Physical dBm)",
+                     "wlanapi.dll -> WlanGetNetworkBssList() -> lRssi (signed 32-bit dBm)",
+                     "Reads real calibrated RF power from the adapter transceiver (±1.5 dB uncertainty). When native query is unavailable, netsh percentage fallback uses: P_rx = (P / 2.0) - 100.0 with ±6.0 dB uncalibrated margin.")
 
-        distance_table = (
-            "Frequency Band │ Frequency (MHz) │ Wavelength (λ) │ Obstacle Penetration │ Optimal Regime\n"
-            "───────────────┼─────────────────┼────────────────┼──────────────────────┼─────────────────────────\n"
-            "2.4 GHz WiFi   │ 2412 - 2484 MHz │ ~12.5 cm       │ High (Concrete/Walls)│ Far distance (>12m)\n"
-            "5.0 GHz WiFi   │ 5180 - 5825 MHz │ ~5.5 cm        │ Medium (Attenuates)  │ Near router (<10m, high QAM)\n"
-            "6.0 GHz WiFi 6E│ 5925 - 7125 MHz │ ~4.5 cm        │ Low (Line-of-Sight)  │ Ultra-wide 160MHz channels"
-        )
-        _code_box(c2, distance_table)
+        _formula_box(c2, "2. Free-Space 1-Meter Reference Path Loss (Friis Model)",
+                     "FSPL_1m (dB) = 20 * log10(f_MHz) - 27.55\n"
+                     "• 2437 MHz (2.4GHz Ch 6):  FSPL_1m = 40.19 dB\n"
+                     "• 5180 MHz (5GHz Ch 36):   FSPL_1m = 46.74 dB\n"
+                     "• 5975 MHz (6GHz Ch 5):    FSPL_1m = 47.98 dB",
+                     "Derivation: FSPL = 20*log10(4*π*d / λ). At d = 1m and c = 3e8 m/s, constant reduces to 20*log10(4*π*10^6 / 3e8) = -27.55 dB.")
 
-        # ── 3. Multi-Objective Scoring Algorithm ──────────────────────────────
+        _formula_box(c2, "3. Environmental Propagation Range Intervals (Inverted Log-Distance)",
+                     "d_n (meters) = 10 ^ ((P_tx - P_rx - FSPL_1m) / (10 * n))\n"
+                     "• n = 2.0 : Free-Space / Clear Line-of-Sight (LOS)\n"
+                     "• n = 3.0 : Indoor Residential / Drywall Partitions\n"
+                     "• n = 4.0 : Dense Obstructions / Reinforced Concrete & Brick Walls",
+                     "Example: At 5180 MHz (5GHz) with router P_tx = 20 dBm and client P_rx = -65 dBm (Path Loss = 85 dB):\n"
+                     "  -> Free Space (n=2.0): d = 81.9 m | Residential (n=3.0): d = 20.8 m | Dense Concrete (n=4.0): d = 8.2 m\n"
+                     "Physical Note: Real indoor Wi-Fi experiences shadow fading; the optimizer displays environmental intervals rather than pseudo-precise single distances.")
+
+        # ── 3. Spectral Overlap & Channel Congestion ──────────────────────────
         c3 = _help_card(
-            "3. The Multi-Objective BSSID Fitness Function (M-BFF)",
+            "3. 22 MHz Spectral Mask Overlap & Co-Channel Interference (CCI)",
+            "📻",
+            "Why overlapping Wi-Fi channels destroy speeds, and how the overlap integral weights interference.",
+            color=COLORS["accent2"]
+        )
+        _formula_box(c3, "22 MHz Overlap Integral Weight Formula",
+                     "w_ov(Δch) = max( 0.0, round( 1.0 - (|Δch| * 5.0 MHz) / 22.0 MHz, 2 ) )\n"
+                     "• Δch = 0 : w_ov = 1.00  (Co-Channel Contention - Direct CSMA/CA Backoff)\n"
+                     "• Δch = 1 : w_ov = 0.77  (Severe Adjacent Channel Spillover)\n"
+                     "• Δch = 2 : w_ov = 0.55  (High Adjacent Interference)\n"
+                     "• Δch = 3 : w_ov = 0.32  (Moderate Channel Bleed)\n"
+                     "• Δch = 4 : w_ov = 0.09  (Marginal Filter Rolloff Overlap)\n"
+                     "• Δch >= 5: w_ov = 0.00  (Orthogonal / Zero Overlap, e.g. Ch 1, 6, 11)",
+                     "Standard 802.11 DSSS/OFDM channels have a 22 MHz spectral mask with 5 MHz center-frequency spacing. Non-orthogonal channels corrupt packet preambles, triggering frame retransmissions.")
+
+        _formula_box(c3, "Effective Channel Congestion Score",
+                     "C_eff = Σ [ w_ov(Δch_j) * w_sig(P_rx,j) ] + 5.0 * u\n"
+                     "f_cong(C) = max( 0.0, 20.0 - 5.0 * C_eff )   ∈ [0, 20 Points]",
+                     "Where u ∈ [0, 1] is the BSS Load channel utilization factor from IEEE 802.11 QBSS elements, and w_sig weights stronger interferers higher.")
+
+        # ── 4. The Multi-Objective Fitness Function (M-BFF) ───────────────────
+        c4 = _help_card(
+            "4. The Multi-Objective BSSID Fitness Function (M-BFF)",
             "📊",
-            "How every detected WiFi access point is mathematically evaluated and scored (0–100 Points).",
+            "Mathematical formulation scoring every candidate access point across 5 objective functions.",
             color=COLORS["warning"]
         )
-        _formula_box(c3, "Calibrated Continuous Sigmoid Signal Curve (0-30 pts)",
-                     "f_sig(P_rx) = 30 / (1 + exp(-0.35 * (P_rx + 72.0)))   [Inflection: -72 dBm = 15.0 pts]")
-        _formula_box(c3, "Effective Channel Congestion Function (0-20 pts)",
-                     "f_cong(C) = max(0.0, 20.0 - 5.0 * C_eff)\n"
-                     "C_eff = Σ w_ov(ch_i, ch_j) * w_sig(P_j)   [w_ov: 1.0, 0.75, 0.50, 0.25, 0.0]")
+        _formula_box(c4, "Master Objective Fitness Formula",
+                     "S(N) = f_sig(P_rx) + f_cong(C) + f_band(B, P_rx) + f_phy(R) + f_sec(A)   ∈ [0, 100 Pts]",
+                     "Evaluates physical signal quality, spectral cleanliness, multi-gigabit band capacity, modulation standard, and encryption cipher.")
 
-        scoring_items = [
-            ("Signal Strength (0-30 pts)", "Calibrated Sigmoid: links > -55 dBm reach 30 pts; drops sharply below -75 dBm where Bit Error Rate (BER) spikes; down to 0.05 pts at -90 dBm."),
-            ("Spectral Congestion (0-20 pts)", "Penalizes co-channel and adjacent-channel interference (CCI) weighted by neighbor signal levels."),
-            ("Band Capacity (0-20 pts)", "Evaluates 5GHz/6GHz bandwidth capacity modulated by link margin distance attenuation h(P_rx)."),
-            ("PHY Modulation (0-20 pts)", "WiFi 7 (802.11be) = 20 pts > WiFi 6 (802.11ax) = 18 pts > WiFi 5 (802.11ac) = 14 pts > WiFi 4 = 9 pts."),
-            ("Security Cipher (0-10 pts)", "WPA3 = 10 pts, WPA2-AES = 8 pts, WPA2-TKIP = 3 pts, Open/WEP = 0 pts (flagged as insecure)."),
-        ]
-        for name, detail in scoring_items:
-            r = ctk.CTkFrame(c3, fg_color="transparent")
-            r.pack(fill="x", pady=2)
-            ctk.CTkLabel(r, text=f"✔  {name}:", font=("Segoe UI", 10, "bold"),
-                         text_color=COLORS["accent"], width=200, anchor="w").pack(side="left")
-            ctk.CTkLabel(r, text=detail, font=("Segoe UI", 10),
-                         text_color=COLORS["text"], anchor="w").pack(side="left")
+        _formula_box(c4, "1. Calibrated Continuous Sigmoid Signal Function (0 - 30 Pts)",
+                     "f_sig(P_rx) = 30.0 / ( 1.0 + exp( -0.35 * (P_rx + 72.0) ) )\n"
+                     "• P_rx >= -55 dBm : f_sig = 29.9 Pts (Near-field saturation, maximum SNR)\n"
+                     "• P_rx = -72 dBm  : f_sig = 15.0 Pts (Calibrated inflection point)\n"
+                     "• P_rx = -75 dBm  : f_sig = 7.9 Pts  (Rapid decline; modulation rate drops)\n"
+                     "• P_rx <= -90 dBm : f_sig < 0.1 Pts  (Receiver sensitivity threshold)",
+                     "Continuous and strictly monotonic: eliminates arbitrary tier jumps while penalizing weak links exponentially.")
 
-        # ── 4. Dynamic Governor & Kernel Stack ────────────────────────────────
-        c4 = _help_card(
-            "4. Dynamic Feedback Governor & Windows Kernel (TCP/IP) Optimization",
-            "🌐",
-            "Unlocking the operating system network pipe to prevent software-level throttling.",
+        _formula_box(c4, "2. Band Capacity with Link Margin Attenuation Gate (0 - 20 Pts)",
+                     "f_band(B, P_rx) = B * [ 1.0 / ( 1.0 + exp( -0.25 * (P_rx + 80.0) ) ) ]\n"
+                     "• 6.0 GHz Band : Base B = 20.0 Pts (Ultra-wide 160/320 MHz channels)\n"
+                     "• 5.0 GHz Band : Base B = 18.0 Pts (Clean 80 MHz channel bonding)\n"
+                     "• 2.4 GHz Band : Base B = 8.0 Pts  (Narrow 20 MHz, high penetration)",
+                     "Dynamic Attenuation: When signal drops below -80 dBm, 5GHz attenuates, allowing 2.4 GHz long-range propagation to win naturally.")
+
+        _formula_box(c4, "3. PHY Modulation Generation (0 - 20 Pts)",
+                     "• 802.11be (Wi-Fi 7, 4096-QAM, 320 MHz, MLO) : 20.0 Pts\n"
+                     "• 802.11ax (Wi-Fi 6/6E, 1024-QAM, OFDMA)      : 18.0 Pts\n"
+                     "• 802.11ac (Wi-Fi 5, 256-QAM, 80 MHz)         : 14.0 Pts\n"
+                     "• 802.11n  (Wi-Fi 4, 64-QAM, MIMO)            : 9.0 Pts\n"
+                     "• 802.11a/b/g (Legacy Modulation)             : 3.0 Pts",
+                     "Higher modulation standards provide denser subcarrier packing and lower latency.")
+
+        _formula_box(c4, "4. Security Policy Gating & Cipher Evaluation",
+                     "• WPA3-SAE (Simultaneous Authentication of Equals) : 10.0 Pts\n"
+                     "• WPA2-AES / CCMP (Counter Mode CBC-MAC)           : 8.0 Pts\n"
+                     "• WPA2-TKIP (Deprecated Stream Cipher)             : 3.0 Pts\n"
+                     "• Open (Plaintext) & WEP (Broken RC4 Cipher)       : HARD DISQUALIFICATION\n"
+                     "  -> is_eligible = False (Excluded from candidate selection by security policy)",
+                     "Saved Profile Filter: The optimizer restricts autonomous roaming to networks in your configured Windows profiles (require_saved_profile=True), preventing rogue AP spoofing.")
+
+        # ── 5. NDIS Driver Hardware Tuning & Inverted Enum Trap ───────────────
+        c5 = _help_card(
+            "5. Discovery-Validated NDIS Driver Tuning & The Inverted Enum Trap",
+            "⚙️",
+            "Why generic Wi-Fi boosters fail: understanding real Intel vs. Realtek driver registry encodings.",
+            color=COLORS["hero_btn"]
+        )
+        enum_table = (
+            "Hardware Intent      │ Intel (AX200, AX201, AX210, BE200) │ Realtek (RTL8821CE, RTL8822BE, RTL8852AE)\n"
+            "─────────────────────┼────────────────────────────────────┼──────────────────────────────────────────\n"
+            "Transmit Power       │ IbssTxPower: '100' = Highest       │ TxPwrLevel: '0' = Highest ('4' is Lowest!)\n"
+            "Roaming Aggressive   │ RoamAggressiveness: '4' = Highest  │ RegROAMSensitiveLevel: '65' = High ('127'=Disable)\n"
+            "Preferred Band       │ RoamingPreferredBandType: '2' = 5G │ PreferBand: '2' = 5G first\n"
+            "MIMO Power Save      │ MIMOPowerSaveMode: '3' = No SMPS   │ (Setting '0' on Intel enables Auto SMPS!)\n"
+            "Sleep on Disconnect  │ *DeviceSleepOnDisconnect: '0'=Off  │ WakeOnDisconnect: '1' = Disabled ('0'=Enabled!)"
+        )
+        _code_box(c5, enum_table)
+
+        _formula_box(c5, "Connection-PHY Gated Short Guard Interval (SGI)",
+                     "Gated strictly by active connection PHY:\n"
+                     "• Active 802.11n or 802.11ac : Enables 400ns SGI (+11% symbol throughput gain)\n"
+                     "• Active 802.11ax or 802.11be: SKIPPED! (Wi-Fi 6 uses dynamic 0.8µs/1.6µs HE guards)",
+                     "Prevents overriding Wi-Fi 6 OFDMA guard intervals while boosting legacy 802.11ac links.")
+
+        _formula_box(c5, "802.1p Layer-2 User Priority VLAN QoS Tagging",
+                     "NDIS Keyword: *PriorityVLANTag = 3 (Packet Priority and VLAN Enabled)\n"
+                     "Sets 3-bit Priority Code Point (PCP) in 802.1Q tags to prioritize gaming & media frames.",
+                     "Clarification: Does not modify router-side WMM contention directly; prioritizes frames inside local Windows network queues.")
+
+        # ── 6. Dynamic Feedback Governor & Anti-Flapping State Machine ────────
+        c6 = _help_card(
+            "6. Dynamic Closed-Loop Link Governor & Anti-Flapping Engine",
+            "🔄",
+            "Preventing hysteresis ping spikes and border thrashing during active gameplay or video calls.",
             color=COLORS["success"]
         )
-        _formula_box(c4, "EWMA-Smoothed Telemetry & Anti-Flapping Governor",
-                     "P_tilde(t) = 0.3 * P_rx(t) + 0.7 * P_tilde(t-1)   [Smoothed RSSI]\n"
-                     "Healthy -> Degraded: 3 consecutive samples < -75 dBm | Degraded -> Healthy: 5 samples >= -70 dBm")
+        _formula_box(c6, "1. EWMA Telemetry Smoothing Filter",
+                     "P_tilde(t) = α * P_rx(t) + (1.0 - α) * P_tilde(t-1)   [Smoothing factor α = 0.3]",
+                     "Suppresses short-term multipath fading dips without delaying sustained degradation detection.")
 
-        kernel_items = [
-            ("TCP Receive Window Auto-Tuning (Normal)", "Scales receive buffers dynamically up to 16MB based on the Bandwidth-Delay Product (BDP = Bandwidth * RTT)."),
-            ("Receive Side Scaling (RSS)", "Distributes network packet interrupt servicing across physical CPU cores to eliminate Core 0 bottlenecks."),
-            ("Explicit Congestion Notification (ECN)", "Instructs routers to mark congested packets rather than dropping them, ending bufferbloat latency spikes."),
-            ("DNS Flush & Fast Anycast Resolvers", "Flushes stale DNS records and configures Cloudflare (1.1.1.1) and Google (8.8.8.8) sub-10ms resolvers."),
-        ]
-        for name, detail in kernel_items:
-            r = ctk.CTkFrame(c4, fg_color="transparent")
-            r.pack(fill="x", pady=2)
-            ctk.CTkLabel(r, text=f"• {name}:", font=("Segoe UI", 10, "bold"),
-                         text_color=COLORS["success"], width=240, anchor="w").pack(side="left")
-            ctk.CTkLabel(r, text=detail, font=("Segoe UI", 10),
-                         text_color=COLORS["text"], anchor="w").pack(side="left")
+        _formula_box(c6, "2. Asymmetric Dual-Threshold Hysteresis State Machine",
+                     "• HEALTHY -> DEGRADED : Requires 3 consecutive samples < -75 dBm\n"
+                     "• DEGRADED -> HEALTHY : Requires 5 consecutive samples >= -70 dBm (5 dB gap)\n"
+                     "• Gradient Drop Rule  : ∇P = P_rx(t) - P_rx(t0) <= -15 dB over <= 12 seconds\n"
+                     "  -> Immediately triggers DEGRADED state without waiting for 3 samples!\n"
+                     "• Roaming Cooldown    : Enforces 30-second cooldown between handoffs to prevent thrashing.",
+                     "100% Non-Destructive Guarantee: The Governor never performs mid-session driver reloads, adapter disables, or TCP resets while streams are active.")
 
-        # ── 5. Safety, Privacy & Reversibility ────────────────────────────────
-        c5 = _help_card(
-            "5. Safety, Privacy & Atomic Snapshot Rollback",
+        # ── 7. Windows Kernel TCP/IP Optimization ─────────────────────────────
+        c7 = _help_card(
+            "7. Windows Kernel TCP/IP Transport Layer Optimization",
+            "🌐",
+            "Uncapping the operating system network pipe to eliminate bufferbloat and DPC queueing delays.",
+            color=COLORS["accent"]
+        )
+        _formula_box(c7, "Dynamic Window Auto-Tuning based on Bandwidth-Delay Product",
+                     "BDP (Bytes) = ( Bandwidth_bps * RTT_sec ) / 8\n"
+                     "netsh int tcp set global autotuninglevel=normal",
+                     "Scales TCP Receive Windows dynamically up to 16 MB. At 1 Gbps with 40ms RTT, BDP = 5 MB. Default static Windows buffers truncate throughput at 64 KB!")
+
+        _formula_box(c7, "Multi-Core Receive Side Scaling (RSS)",
+                     "netsh int tcp set global rss=enabled",
+                     "Distributes packet interrupt servicing across multiple CPU cores, preventing Core 0 thread saturation during multi-gigabit downloads.")
+
+        _formula_box(c7, "Explicit Congestion Notification (ECN, RFC 3168)",
+                     "netsh int tcp set global ecncapability=enabled",
+                     "Instructs intervening routers to mark Congestion Experienced (CE) bits instead of dropping packets, ending bufferbloat latency spikes.")
+
+        # ── 8. Safety, Reversibility & Dry-Run Preview ────────────────────────
+        c8 = _help_card(
+            "8. Safety, Reversibility & Dry-Run Preview Architecture",
             "🛡️",
-            "Why administrator rights are requested and how settings are safely managed and reversed.",
+            "Complete transparency: preview before changing, and restore defaults with one click.",
             color="#A78BFA"
         )
-        ctk.CTkLabel(c5, text="• Atomic Rollback Snapshots: Every modified adapter registry key is saved before changes are applied (adapter_rollback_snapshot.json). Original values are restored and created keys are deleted on rollback.\n• Parameter Discovery: Only driver properties verified via 'Ndi\\params' are modified, preventing invalid writes.\n• 100% Non-Destructive: Background monitoring never restarts the network adapter or disrupts active streams.\n• Why Administrator is Needed: Windows protects adapter hardware registry keys from unprivileged access. Running as Administrator unlocks direct hardware transceiver tuning.",
-                     font=("Segoe UI", 10), text_color=COLORS["text"],
-                     justify="left", anchor="w", wraplength=760).pack(padx=8, pady=4, fill="x")
+        safety_text = (
+            "• Read-Only Preview (Dry-Run): Toggle 'Preview Changes' to inspect exact Current -> Proposed values before anything is written.\n"
+            "• Automatic Snapshot Backup: Before modifying any setting, the optimizer writes adapter_rollback_snapshot.json saving original driver and TCP values.\n"
+            "• One-Click Rollback / Restore: Reverts all modified keys to OEM defaults and removes newly created registry parameters.\n"
+            "• Discovery Validation: Properties not declared in your driver's 'Ndi\\params' database are skipped—never guessed.\n"
+            "• Target Interface Detection: Automatically identifies your active wireless interface name (fixes issues on non-English Windows editions)."
+        )
+        _code_box(c8, safety_text)
 
     # ═══════════════════════════════════════════════════════════════════════════
     # ABOUT PAGE
@@ -1203,13 +1315,15 @@ class WiFiOptimizerApp(ctk.CTk):
             cong = get_channel_congestion(nets)
             scored = sorted([score_network(n, cong, profile) for n in nets],
                             key=lambda x: x.total_score, reverse=True)
+            connected_score = None
             if adapter:
                 for sc in scored:
                     if sc.network.ssid == adapter.ssid:
                         sc.network.connected = True
+                        connected_score = sc.total_score
             self._all_networks = scored
             self.after(0, lambda: (
-                self._update_chips(adapter),
+                self._update_chips(adapter, connected_score),
                 self._update_gauge(adapter),
                 self._update_networks_page(scored),
             ))
@@ -1507,12 +1621,13 @@ class WiFiOptimizerApp(ctk.CTk):
         before = self._before_snapshot
         after = self._after_snapshot or before
 
-        # Score = avg of (settings applied ratio) + (network score)
-        applied_ratio = min(1.0, len(result.settings_applied) / 10.0)
-        net_score = result.network_scores[0].total_score if result.network_scores else 50.0
-        total_score = int((applied_ratio * 50) + (net_score * 0.5))
+        # Optimization Level: percentage of recommended tweaks successfully applied
+        applied_count = len(result.settings_applied)
+        failed_count = len(result.settings_failed)
+        total_tweaks = max(1, applied_count + failed_count)
+        opt_level = int((applied_count / total_tweaks) * 100)
 
-        self._score_badge.animate_to(total_score)
+        self._score_badge.animate_to(opt_level)
 
         # ── Before / After bars ───────────────────────────────────────────────
         if before:
@@ -1624,7 +1739,7 @@ class WiFiOptimizerApp(ctk.CTk):
         q = self._quality(adapter.signal_percent)
         self._gauge.set_signal(adapter.signal_percent, q)
 
-    def _update_chips(self, adapter):
+    def _update_chips(self, adapter, net_score=None):
         if not adapter: return
         self._chips["ssid"].update(adapter.ssid or "—")
         self._chips["band"].update(adapter.radio_type or "—")
@@ -1633,6 +1748,13 @@ class WiFiOptimizerApp(ctk.CTk):
                                      if adapter.receive_rate_mbps else "—")
         self._chips["txrate"].update(f"{adapter.transmit_rate_mbps:.0f} Mbps"
                                      if adapter.transmit_rate_mbps else "—")
+        if "quality" in self._chips:
+            if net_score is not None:
+                self._chips["quality"].update(f"{net_score:.0f} / 100")
+            elif hasattr(adapter, 'quality') and adapter.quality:
+                self._chips["quality"].update(adapter.quality)
+            else:
+                self._chips["quality"].update(self._quality(adapter.signal_percent))
         self._status_dot.configure(
             text=f"● {adapter.ssid or 'Not connected'}  {adapter.signal_percent}%",
             text_color=COLORS["success"] if adapter.signal_percent >= 40 else COLORS["danger"])
@@ -1684,7 +1806,10 @@ class WiFiOptimizerApp(ctk.CTk):
 
     def _apply_snapshot(self, snap):
         self._gauge.set_signal(snap.signal_percent, snap.quality)
-        self._chips["down"].update(f"{snap.throughput_down_mbps:.2f} Mbps")
+        if "quality" in self._chips:
+            self._chips["quality"].update(snap.quality)
+        if "down" in self._chips:
+            self._chips["down"].update(f"{snap.throughput_down_mbps:.2f} Mbps")
         self._status_dot.configure(
             text=f"● {snap.ssid or 'Not connected'}  {snap.signal_percent}%",
             text_color=COLORS["success"] if snap.signal_percent >= 40 else COLORS["danger"])

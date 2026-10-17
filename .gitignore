@@ -3,6 +3,7 @@ __pycache__/
 *$py.class
 *.log
 adapter_rollback_snapshot.json
+adapter_settings_backup.json
 dist/
 build/
 .pytest_cache/

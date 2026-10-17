@@ -348,6 +348,20 @@ class WiFiOptimizerApp(ctk.CTk):
         self._setup_window()
         self._build_ui()
         self._schedule_auto_refresh()
+        # Auto-detect the wireless interface name (may differ from "Wi-Fi" on
+        # other laptops) so the netsh-based features target the right adapter.
+        threading.Thread(target=self._detect_adapter_name, daemon=True).start()
+
+    def _detect_adapter_name(self):
+        """Detect and apply the real wireless interface name."""
+        try:
+            from core.adapter_manager import detect_wifi_interface_name
+            name = detect_wifi_interface_name()
+            if name and name != "Wi-Fi":
+                self.after(0, lambda n=name: self._adapter_var.set(n))
+                logger.info("Detected wireless interface name: %s", name)
+        except Exception as e:
+            logger.debug("Adapter name detection skipped: %s", e)
 
     # ─── Window setup ─────────────────────────────────────────────────────────
     def _setup_window(self):
@@ -382,6 +396,7 @@ class WiFiOptimizerApp(ctk.CTk):
         for key, lbl in [("dashboard", "🏠  Dashboard"),
                            ("networks",  "📡  Networks"),
                            ("settings",  "⚙️   Settings"),
+                           ("hardware",  "🔧  Hardware"),
                            ("help",      "❓  How It Works"),
                            ("about",     "ℹ️   About")]:
             b = ctk.CTkButton(self._sidebar, text=lbl, anchor="w",
@@ -393,6 +408,94 @@ class WiFiOptimizerApp(ctk.CTk):
                                command=lambda k=key: self._nav(k))
             b.pack(fill="x", padx=8, pady=2)
             self._nav_btns[key] = b
+
+        # ── Hero: Optimize section (own div, below About) ──────────────────
+        hero = ctk.CTkFrame(self._sidebar, fg_color=COLORS["surface2"],
+                             corner_radius=12, border_width=1,
+                             border_color=COLORS["accent_glow"])
+        hero.pack(fill="x", padx=8, pady=(8, 0))
+
+        # Profile selector — vertical list so every option is visible
+        ctk.CTkLabel(hero, text="Choose a profile:", font=("Segoe UI", 9),
+                     text_color=COLORS["text_muted"]).pack(anchor="w", padx=10, pady=(8, 2))
+        self._profile_var = ctk.StringVar(value="selfish")
+        self._profile_options = [
+            ("selfish",    "⚡ Selfish Turbo"),
+            ("max_speed",  "🚀 Max Speed"),
+            ("max_range",  "📶 Max Range"),
+            ("balanced",   "⚖️ Balanced"),
+            ("power_save", "🔋 Power Saver"),
+        ]
+        self._profile_radios = {}
+        for key, label in self._profile_options:
+            rb = ctk.CTkRadioButton(
+                hero, text=label, variable=self._profile_var, value=key,
+                font=("Segoe UI", 11),
+                radiobutton_width=16, radiobutton_height=16,
+                border_width_checked=4,
+                fg_color=COLORS["accent"], hover_color=COLORS["hero_hover"],
+                text_color=COLORS["text"])
+            rb.pack(anchor="w", padx=12, pady=1)
+            self._profile_radios[key] = rb
+
+        # Optimize button (directly under the profile list)
+        self._optimize_btn = ctk.CTkButton(
+            hero,
+            text="⚡ OPTIMIZE NOW",
+            font=("Segoe UI", 13, "bold"),
+            fg_color=COLORS["hero_btn"],
+            hover_color=COLORS["hero_hover"],
+            text_color="#FFFFFF",
+            corner_radius=10,
+            height=40,
+            command=self._do_optimize)
+        self._optimize_btn.pack(fill="x", padx=8, pady=(8, 4))
+
+        # Preview (dry-run) toggle — shows what WOULD change before applying
+        self._preview_var = ctk.BooleanVar(value=False)
+        ctk.CTkSwitch(
+            hero, text="Preview only (don't apply)",
+            variable=self._preview_var,
+            command=self._on_preview_toggle,
+            font=("Segoe UI", 10), text_color=COLORS["text_muted"],
+            progress_color=COLORS["accent"],
+            switch_width=34, switch_height=18).pack(anchor="w", padx=10, pady=(0, 4))
+
+        # Progress bar + labels
+        self._progress = ctk.CTkProgressBar(hero, mode="indeterminate",
+                                             fg_color=COLORS["surface"],
+                                             progress_color=COLORS["accent"],
+                                             height=4, corner_radius=2)
+        self._progress.pack(fill="x", padx=8, pady=(0, 2))
+        self._progress_lbl = ctk.CTkLabel(hero, text="",
+                                           font=("Segoe UI", 9, "italic"),
+                                           text_color=COLORS["accent"])
+        self._progress_lbl.pack(padx=8, anchor="w")
+
+        # Hero sub-label (status text shown during optimization)
+        self._hero_sub = ctk.CTkLabel(
+            hero,
+            text="",
+            font=("Segoe UI", 9), text_color=COLORS["text_muted"])
+        self._hero_sub.pack(padx=8, pady=(0, 4), anchor="w")
+
+        # Bottom row: Scan + Help
+        h_btns = ctk.CTkFrame(hero, fg_color="transparent")
+        h_btns.pack(fill="x", padx=8, pady=(0, 8))
+        self._scan_btn = ctk.CTkButton(
+            h_btns, text="🔍 Scan", width=70, height=26,
+            font=("Segoe UI", 10),
+            fg_color=COLORS["surface"],
+            hover_color=COLORS["border"],
+            command=self._do_scan)
+        self._scan_btn.pack(side="left", padx=(0, 4))
+        self._help_btn = ctk.CTkButton(
+            h_btns, text="❓ Help", width=70, height=26,
+            font=("Segoe UI", 10),
+            fg_color=COLORS["surface"],
+            hover_color=COLORS["border"],
+            command=lambda: self._nav("help"))
+        self._help_btn.pack(side="left")
 
         ctk.CTkFrame(self._sidebar, fg_color="transparent").pack(expand=True)
         self._status_dot = ctk.CTkLabel(self._sidebar, text="● Not scanning",
@@ -408,6 +511,7 @@ class WiFiOptimizerApp(ctk.CTk):
         self._build_dashboard()
         self._build_networks_page()
         self._build_settings_page()
+        self._build_hardware_page()
         self._build_help_page()
         self._build_about_page()
         self._nav("dashboard")
@@ -433,85 +537,6 @@ class WiFiOptimizerApp(ctk.CTk):
         # ── Scrollable inner ──────────────────────────────────────────────────
         scroll = ctk.CTkScrollableFrame(page, fg_color=COLORS["bg"], corner_radius=0)
         scroll.pack(fill="both", expand=True)
-
-        # ─────────────────────────────────────────────────────────────────────
-        # HERO: BIG OPTIMIZE BUTTON
-        # ─────────────────────────────────────────────────────────────────────
-        hero = ctk.CTkFrame(scroll, fg_color=COLORS["surface"],
-                             corner_radius=20, border_width=1,
-                             border_color=COLORS["accent_glow"])
-        hero.pack(fill="x", padx=24, pady=(20, 0))
-
-        # Title row
-        htitle = ctk.CTkFrame(hero, fg_color="transparent")
-        htitle.pack(fill="x", padx=24, pady=(18, 0))
-        # Header action buttons
-        h_btns = ctk.CTkFrame(htitle, fg_color="transparent")
-        h_btns.pack(side="right")
-
-        self._help_btn = ctk.CTkButton(
-            h_btns, text="❓ How It Works", width=125, height=28,
-            font=("Segoe UI", 11),
-            fg_color=COLORS["surface2"],
-            hover_color=COLORS["border"],
-            command=lambda: self._nav("help"))
-        self._help_btn.pack(side="left", padx=(0, 6))
-
-        self._scan_btn = ctk.CTkButton(
-            h_btns, text="🔍 Scan", width=80, height=28,
-            font=("Segoe UI", 11),
-            fg_color=COLORS["surface2"],
-            hover_color=COLORS["border"],
-            command=self._do_scan)
-        self._scan_btn.pack(side="left")
-
-        # Sub-label
-        self._hero_sub = ctk.CTkLabel(
-            hero,
-            text="Click OPTIMIZE to analyze your connection and apply the best settings.",
-            font=("Segoe UI", 12), text_color=COLORS["text_muted"])
-        self._hero_sub.pack(padx=24, pady=(4, 0), anchor="w")
-
-        # Profile selector (compact)
-        prow = ctk.CTkFrame(hero, fg_color="transparent")
-        prow.pack(fill="x", padx=24, pady=(10, 0))
-        ctk.CTkLabel(prow, text="Profile:", font=("Segoe UI", 11),
-                     text_color=COLORS["text_muted"]).pack(side="left")
-        self._profile_var = ctk.StringVar(value="selfish")
-        self._profile_seg = ctk.CTkSegmentedButton(
-            prow,
-            values=["⚡ Selfish Turbo", "Max Speed", "Max Range", "Balanced", "Power Saver"],
-            command=self._on_profile_change,
-            font=("Segoe UI", 11),
-            height=30)
-        self._profile_seg.set("⚡ Selfish Turbo")
-        self._profile_seg.pack(side="left", padx=(8, 0))
-
-        # ── THE OPTIMIZE BUTTON ───────────────────────────────────────────────
-        self._optimize_btn = ctk.CTkButton(
-            hero,
-            text="⚡  OPTIMIZE NOW",
-            font=("Segoe UI", 22, "bold"),
-            fg_color=COLORS["hero_btn"],
-            hover_color=COLORS["hero_hover"],
-            text_color="#FFFFFF",
-            corner_radius=16,
-            height=72,
-            command=self._do_optimize)
-        self._optimize_btn.pack(fill="x", padx=24, pady=(14, 0))
-
-        # Progress bar (under optimize button)
-        self._progress = ctk.CTkProgressBar(hero, mode="indeterminate",
-                                             fg_color=COLORS["surface2"],
-                                             progress_color=COLORS["accent"],
-                                             height=4, corner_radius=2)
-        self._progress_lbl = ctk.CTkLabel(hero, text="",
-                                           font=("Segoe UI", 11, "italic"),
-                                           text_color=COLORS["accent"])
-        self._progress_lbl.pack(padx=24, anchor="w")
-
-        # Spacer below button
-        ctk.CTkFrame(hero, fg_color="transparent", height=16).pack()
 
         # ─────────────────────────────────────────────────────────────────────
         # LIVE STEPS PANEL (hidden until optimizing)
@@ -624,7 +649,7 @@ class WiFiOptimizerApp(ctk.CTk):
         status_card = ctk.CTkFrame(scroll, fg_color=COLORS["card"],
                                     corner_radius=14, border_width=1,
                                     border_color=COLORS["border"])
-        status_card.pack(fill="x", padx=24, pady=(14, 0))
+        status_card.pack(fill="x", padx=20, pady=(10, 0))
 
         ctk.CTkLabel(status_card, text="Live Status",
                      font=("Segoe UI", 12, "bold"),
@@ -660,17 +685,7 @@ class WiFiOptimizerApp(ctk.CTk):
             self._chips[key] = chip
 
         # Bottom spacer
-        ctk.CTkFrame(scroll, fg_color="transparent", height=20).pack()
-
-    def _on_profile_change(self, value: str):
-        mapping = {
-            "⚡ Selfish Turbo": "selfish",
-            "Max Speed":       "max_speed",
-            "Max Range":       "max_range",
-            "Balanced":        "balanced",
-            "Power Saver":     "power_save",
-        }
-        self._profile_var.set(mapping.get(value, "selfish"))
+        ctk.CTkFrame(scroll, fg_color="transparent", height=12).pack()
 
     # ═══════════════════════════════════════════════════════════════════════════
     # NETWORKS PAGE
@@ -725,7 +740,8 @@ class WiFiOptimizerApp(ctk.CTk):
 
         # Adapter name
         ac = self._scard(scroll, "🔌 Wi-Fi Adapter Name",
-                          "Usually 'Wi-Fi' — check Device Manager if different.")
+                          "Auto-detected on startup. Override only if needed "
+                          "(must match the netsh interface name exactly).")
         self._adapter_var = ctk.StringVar(value="Wi-Fi")
         ctk.CTkEntry(ac, textvariable=self._adapter_var, width=200,
                      font=("Segoe UI", 12),
@@ -778,6 +794,136 @@ class WiFiOptimizerApp(ctk.CTk):
         ctk.CTkLabel(c, text=description, font=("Segoe UI", 10),
                      text_color=COLORS["text_muted"]).pack(anchor="w", padx=16, pady=(0, 8))
         return c
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # HARDWARE CAPABILITIES PAGE
+    # ═══════════════════════════════════════════════════════════════════════════
+    def _build_hardware_page(self):
+        page = ctk.CTkFrame(self._content, fg_color=COLORS["bg"])
+        self._pages["hardware"] = page
+
+        hdr = ctk.CTkFrame(page, fg_color="transparent")
+        hdr.pack(fill="x", padx=24, pady=(20, 0))
+        ctk.CTkLabel(hdr, text="🔧  Hardware Capabilities",
+                     font=("Segoe UI", 20, "bold"),
+                     text_color=COLORS["text"]).pack(side="left")
+        ctk.CTkButton(hdr, text="↩ Restore Defaults", width=150, height=30,
+                      font=("Segoe UI", 11),
+                      fg_color=COLORS["surface2"],
+                      hover_color=COLORS["danger"],
+                      command=self._do_restore).pack(side="right", padx=(6, 0))
+        ctk.CTkButton(hdr, text="🔄 Rescan", width=90, height=30,
+                      font=("Segoe UI", 11),
+                      fg_color=COLORS["surface2"],
+                      hover_color=COLORS["border"],
+                      command=self._refresh_hardware).pack(side="right")
+
+        ctk.CTkLabel(
+            page,
+            text=("Which optimizer settings your WiFi driver actually exposes "
+                  "(verified via the Windows NDIS Ndi\\params database). "
+                  "Settings marked ✘ cannot be applied by this driver."),
+            font=("Segoe UI", 11), text_color=COLORS["text_muted"],
+            justify="left", wraplength=800).pack(anchor="w", padx=24, pady=(4, 8))
+
+        self._hw_scroll = ctk.CTkScrollableFrame(page, fg_color=COLORS["bg"],
+                                                  corner_radius=0)
+        self._hw_scroll.pack(fill="both", expand=True, padx=24, pady=(0, 16))
+        self._refresh_hardware()
+
+    def _refresh_hardware(self):
+        for w in self._hw_scroll.winfo_children():
+            w.destroy()
+
+        from core.adapter_manager import discover_optimizer_capabilities
+        try:
+            report = discover_optimizer_capabilities()
+        except Exception as e:
+            logger.error("Hardware discovery failed: %s", e)
+            ctk.CTkLabel(self._hw_scroll, text=f"Discovery error: {e}",
+                         font=("Segoe UI", 11),
+                         text_color=COLORS["danger"]).pack(anchor="w")
+            return
+
+        if not report:
+            ctk.CTkLabel(self._hw_scroll,
+                         text="No wireless adapters detected (or running without access).",
+                         font=("Segoe UI", 12),
+                         text_color=COLORS["text_muted"]).pack(anchor="w")
+            return
+
+        for adapter in report:
+            card = ctk.CTkFrame(self._hw_scroll, fg_color=COLORS["card"],
+                                corner_radius=12, border_width=1,
+                                border_color=COLORS["border"])
+            card.pack(fill="x", pady=(0, 12))
+
+            ctk.CTkLabel(card, text=adapter["desc"],
+                         font=("Segoe UI", 13, "bold"),
+                         text_color=COLORS["accent"]).pack(anchor="w", padx=14, pady=(10, 0))
+            ctk.CTkLabel(
+                card,
+                text=f"Adapter key {adapter['subkey']}  ·  {adapter['param_count']} driver parameters exposed",
+                font=("Segoe UI", 10),
+                text_color=COLORS["text_muted"]).pack(anchor="w", padx=14, pady=(0, 6))
+
+            grid = ctk.CTkFrame(card, fg_color="transparent")
+            grid.pack(fill="x", padx=14, pady=(0, 12))
+            grid.columnconfigure(0, weight=1)
+            grid.columnconfigure(1, weight=1)
+
+            for i, (label, info) in enumerate(adapter["capabilities"].items()):
+                avail = info["available"]
+                row = ctk.CTkFrame(
+                    grid,
+                    fg_color=COLORS["success_dim"] if avail else COLORS["surface2"],
+                    corner_radius=6)
+                row.grid(row=i // 2, column=i % 2, padx=4, pady=3, sticky="ew")
+                icon = "✔" if avail else "✘"
+                color = COLORS["success"] if avail else COLORS["text_muted"]
+                ctk.CTkLabel(row, text=f"{icon}  {label}",
+                             font=("Segoe UI", 11, "bold"),
+                             text_color=color, anchor="w").pack(anchor="w", padx=8, pady=(4, 0))
+                sub = info["keyword"] if avail else "not exposed by driver"
+                ctk.CTkLabel(row, text=sub, font=("Segoe UI", 9),
+                             text_color=COLORS["text_muted"],
+                             anchor="w").pack(anchor="w", padx=8, pady=(0, 4))
+                if avail and info.get("options"):
+                    opts = " | ".join(info["options"][:6])
+                    ctk.CTkLabel(row, text=opts, font=("Segoe UI", 8),
+                                 text_color=COLORS["text_muted"], anchor="w",
+                                 wraplength=340, justify="left").pack(anchor="w", padx=8, pady=(0, 4))
+
+    def _do_restore(self):
+        """Restore all changed WiFi adapter settings to their original values."""
+        from tkinter import messagebox
+        from core.adapter_manager import rollback_settings
+
+        if not messagebox.askyesno(
+                "Restore Defaults",
+                "Restore all WiFi adapter settings changed by this optimizer "
+                "back to their original values?\n\n"
+                "This undoes the registry changes made during optimization. "
+                "WiFi may briefly disconnect while the driver reinitializes."):
+            return
+
+        try:
+            ok, log = rollback_settings()
+        except Exception as e:
+            logger.error("Rollback failed: %s", e)
+            messagebox.showerror("Restore Failed", f"Could not restore settings:\n{e}")
+            return
+
+        if not log:
+            messagebox.showinfo("Restore Complete", "Nothing to restore — no changes on record.")
+        else:
+            shown = "\n".join(log[:15])
+            if len(log) > 15:
+                shown += f"\n... (+{len(log) - 15} more)"
+            messagebox.showinfo("Restore Complete",
+                                f"{'Restored' if ok else 'Partially restored'} "
+                                f"{len(log)} setting(s):\n\n{shown}")
+        self._refresh_hardware()
 
     # ═══════════════════════════════════════════════════════════════════════════
     # HOW IT WORKS / HELP PAGE
@@ -1073,11 +1219,19 @@ class WiFiOptimizerApp(ctk.CTk):
             self.after(0, lambda: self._scan_btn.configure(
                 state="normal", text="🔍 Scan"))
 
+    def _on_preview_toggle(self):
+        """Update the optimize button label to reflect preview (dry-run) mode."""
+        if self._preview_var.get():
+            self._optimize_btn.configure(text="👀 PREVIEW CHANGES")
+        else:
+            self._optimize_btn.configure(text="⚡ OPTIMIZE NOW")
+
     def _do_optimize(self):
         if self._optimizing:
             return
         self._optimizing = True
         self._opt_start_time = time.time()
+        preview = bool(self._preview_var.get())
 
         # Capture BEFORE state
         from core.wifi_scanner import get_connected_network
@@ -1089,16 +1243,18 @@ class WiFiOptimizerApp(ctk.CTk):
         # Lock button, show progress
         self._optimize_btn.configure(
             state="disabled",
-            text="⏳  Optimizing…",
+            text="⏳  Analyzing…" if preview else "⏳  Optimizing…",
             fg_color=COLORS["accent_glow"])
         self._progress.pack(fill="x", padx=24, pady=(4, 0))
         self._progress.start()
         self._hero_sub.configure(
-            text="Analyzing your connection and applying the best settings…",
+            text=("Scanning and building a read-only preview — nothing will be written…"
+                  if preview else
+                  "Analyzing your connection and applying the best settings…"),
             text_color=COLORS["accent"])
 
         # Show steps card and build step rows
-        self._steps_card.pack(fill="x", padx=24, pady=(14, 0))
+        self._steps_card.pack(fill="x", padx=20, pady=(10, 0))
         for w in self._steps_inner.winfo_children():
             w.destroy()
         self._step_items.clear()
@@ -1189,11 +1345,13 @@ class WiFiOptimizerApp(ctk.CTk):
         self.after(0, lambda: self._update_step(0, "running"))
 
         try:
+            preview = bool(self._preview_var.get())
             result = run_optimization(
                 profile_key=self._profile_var.get(),
                 adapter_name=getattr(self, '_adapter_var',
                                      type('_', (), {'get': lambda s: 'Wi-Fi'})()).get(),
                 progress_callback=progress,
+                preview=preview,
             )
             # Mark remaining steps done
             for i in range(len(self._step_items)):
@@ -1206,7 +1364,10 @@ class WiFiOptimizerApp(ctk.CTk):
             self._after_snapshot = get_connected_network()
             elapsed = time.time() - self._opt_start_time
 
-            self.after(300, lambda: self._show_result(result, elapsed))
+            if preview:
+                self.after(300, lambda: self._show_preview(result))
+            else:
+                self.after(300, lambda: self._show_result(result, elapsed))
         except Exception as e:
             logger.error("Optimization error: %s", e)
             self.after(0, lambda: self._progress_lbl.configure(
@@ -1222,15 +1383,122 @@ class WiFiOptimizerApp(ctk.CTk):
 
     def _optimize_done(self):
         self._optimizing = False
+        # Safety: never leave preview mode enabled after a run, even on error
+        try:
+            from core.adapter_manager import set_preview_mode
+            set_preview_mode(False)
+        except Exception:
+            pass
         self._optimize_btn.configure(
             state="normal",
-            text="⚡  OPTIMIZE NOW",
+            text="👀 PREVIEW CHANGES" if self._preview_var.get() else "⚡  OPTIMIZE NOW",
             fg_color=COLORS["hero_btn"])
         self._progress.stop()
         self._progress.pack_forget()
-        self._hero_sub.configure(
-            text="Optimization complete! See your results below.",
-            text_color=COLORS["success"])
+        if self._preview_var.get():
+            self._hero_sub.configure(
+                text="Preview ready — nothing was changed.",
+                text_color=COLORS["accent"])
+        else:
+            self._hero_sub.configure(
+                text="Optimization complete! See your results below.",
+                text_color=COLORS["success"])
+
+    def _show_preview(self, result):
+        """Show a read-only list of every change the run WOULD make."""
+        changes = result.preview_changes or []
+        will_change = [c for c in changes if c.get("changed")]
+        already = [c for c in changes if not c.get("changed")]
+
+        win = ctk.CTkToplevel(self)
+        win.title(f"Preview — {result.profile_name}")
+        win.geometry("780x600")
+        win.configure(fg_color=COLORS["bg"])
+        win.transient(self)
+        win.after(80, win.lift)
+
+        hdr = ctk.CTkFrame(win, fg_color="transparent")
+        hdr.pack(fill="x", padx=18, pady=(16, 4))
+        ctk.CTkLabel(hdr, text="👀  Preview — nothing has been changed",
+                     font=("Segoe UI", 17, "bold"),
+                     text_color=COLORS["accent"]).pack(anchor="w")
+        ctk.CTkLabel(
+            win,
+            text=(f"Profile: {result.profile_name}\n"
+                  f"Registry/config values that WOULD change: {len(will_change)}   ·   "
+                  f"already at target (no-op): {len(already)}   ·   "
+                  f"total evaluated: {len(changes)}\n"
+                  "Nothing is written until you switch 'Preview only' off and press OPTIMIZE NOW."),
+            font=("Segoe UI", 11), text_color=COLORS["text_muted"],
+            justify="left", wraplength=730).pack(anchor="w", padx=18, pady=(0, 8))
+
+        scroll = ctk.CTkScrollableFrame(win, fg_color=COLORS["bg"])
+        scroll.pack(fill="both", expand=True, padx=18, pady=(0, 8))
+
+        if not changes:
+            ctk.CTkLabel(scroll, text="No changes would be made on this hardware.",
+                         font=("Segoe UI", 12),
+                         text_color=COLORS["text_muted"]).pack(anchor="w", pady=10)
+        else:
+            if will_change:
+                ctk.CTkLabel(scroll, text=f"⚡ Will change ({len(will_change)})",
+                             font=("Segoe UI", 13, "bold"),
+                             text_color=COLORS["success"]).pack(anchor="w", pady=(4, 4))
+                self._render_preview_rows(scroll, will_change, highlight=True)
+
+            if already:
+                ctk.CTkLabel(scroll, text=f"✓ Already at target — no change ({len(already)})",
+                             font=("Segoe UI", 13, "bold"),
+                             text_color=COLORS["text_muted"]).pack(anchor="w", pady=(14, 4))
+                self._render_preview_rows(scroll, already, highlight=False)
+
+        btns = ctk.CTkFrame(win, fg_color="transparent")
+        btns.pack(fill="x", padx=18, pady=(0, 16))
+        ctk.CTkButton(btns, text="Close", width=110, height=34,
+                      font=("Segoe UI", 12),
+                      fg_color=COLORS["surface2"], hover_color=COLORS["border"],
+                      command=win.destroy).pack(side="right")
+
+    def _render_preview_rows(self, parent, items, highlight: bool):
+        """Render preview change rows grouped by adapter."""
+        grouped = {}
+        for c in items:
+            grouped.setdefault(c.get("adapter", "?"), []).append(c)
+
+        for adapter, rows in grouped.items():
+            ctk.CTkLabel(parent, text=adapter,
+                         font=("Segoe UI", 11, "bold"),
+                         text_color=COLORS["accent"] if highlight else COLORS["text"],
+                         anchor="w").pack(anchor="w", pady=(6, 2))
+            for c in rows:
+                row = ctk.CTkFrame(
+                    parent,
+                    fg_color=COLORS["card"] if highlight else COLORS["surface2"],
+                    corner_radius=8, border_width=1,
+                    border_color=COLORS["border"])
+                row.pack(fill="x", pady=2)
+                top = ctk.CTkFrame(row, fg_color="transparent")
+                top.pack(fill="x", padx=10, pady=(6, 0))
+                name = c.get("intent") or c.get("property", "?")
+                ctk.CTkLabel(top, text=name, font=("Segoe UI", 11, "bold"),
+                             text_color=COLORS["text"]).pack(side="left")
+                ctk.CTkLabel(top, text=c.get("property", ""),
+                             font=("Segoe UI", 9),
+                             text_color=COLORS["text_muted"]).pack(side="left", padx=8)
+                cur = c.get("current")
+                cur_txt = cur if cur is not None else "(not set)"
+                val = ctk.CTkFrame(row, fg_color="transparent")
+                val.pack(fill="x", padx=10, pady=(2, 6))
+                ctk.CTkLabel(val, text=f"{cur_txt}", font=("Segoe UI", 10),
+                             text_color=COLORS["text_muted"]).pack(side="left")
+                arrow = "  →  " if highlight else "  =  "
+                ctk.CTkLabel(val, text=arrow, font=("Segoe UI", 10),
+                             text_color=COLORS["accent"] if highlight else COLORS["text_muted"]
+                             ).pack(side="left")
+                ctk.CTkLabel(val, text=f"{c.get('proposed', '')}",
+                             font=("Segoe UI", 10, "bold"),
+                             text_color=COLORS["success"] if highlight else COLORS["text_muted"]
+                             ).pack(side="left")
 
     def _show_result(self, result, elapsed: float):
         from ui.notifications import notify_optimization_complete
@@ -1304,11 +1572,13 @@ class WiFiOptimizerApp(ctk.CTk):
                          text_color=COLORS["success"],
                          anchor="w").pack(padx=8, pady=5, fill="x")
 
-        # Failed (smaller)
-        for s in result.settings_failed:
+        # Failed (smaller) — use grid to stay consistent with applied chips
+        applied_rows = (count + cols - 1) // cols if count > 0 else 0
+        for i, s in enumerate(result.settings_failed):
             chip = ctk.CTkFrame(self._applied_frame, fg_color=COLORS["surface2"],
                                  corner_radius=6)
-            chip.pack(fill="x", pady=2)
+            chip.grid(row=applied_rows + i // cols, column=i % cols, padx=4, pady=3, sticky="ew")
+            self._applied_frame.columnconfigure(i % cols, weight=1)
             ctk.CTkLabel(chip, text=f"⊘  {s}  (run as Administrator for full access)",
                          font=("Segoe UI", 9),
                          text_color=COLORS["text_muted"],

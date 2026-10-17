@@ -5,7 +5,7 @@ Analyzes scanned networks and applies the best settings for maximum performance.
 
 import logging
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 from core.wifi_scanner import WiFiNetwork, AdapterInfo, scan_networks, get_connected_network, get_channel_congestion
 from core import adapter_manager
@@ -139,6 +139,7 @@ class OptimizationResult:
     adapter_info: Optional[AdapterInfo]
     channel_congestion: dict
     recommendations: List[str]
+    preview_changes: List[dict] = field(default_factory=list)
 
 
 def calculate_sig_score(dbm: float) -> float:
@@ -388,14 +389,27 @@ def build_recommendations(adapter_info: Optional[AdapterInfo],
 
 def run_optimization(profile_key: str = "balanced",
                      adapter_name: str = "Wi-Fi",
-                     progress_callback=None) -> OptimizationResult:
+                     progress_callback=None,
+                     preview: bool = False) -> OptimizationResult:
     """
     Main optimization function. Scans networks, scores them,
     applies optimal adapter settings, and returns a full result.
+
+    When preview=True, nothing is written to the system: every proposed change
+    is recorded (real current value -> proposed value) and returned in
+    OptimizationResult.preview_changes so the user can review before applying.
     """
     profile = PROFILES.get(profile_key, PROFILES["balanced"])
     settings_applied = []
     settings_failed = []
+    preview_changes: List[dict] = []
+
+    if preview:
+        adapter_manager.set_preview_mode(True)
+    else:
+        # Defensive: ensure a real run is never silently suppressed by a
+        # preview flag left on from an interrupted preview.
+        adapter_manager.set_preview_mode(False)
 
     def _progress(msg: str):
         logger.info(msg)
@@ -408,6 +422,11 @@ def run_optimization(profile_key: str = "balanced",
 
     _progress("📊 Checking current connection...")
     adapter_info = get_connected_network()
+
+    # Prefer the LIVE connected interface name for netsh commands. The name in
+    # Settings may be stale or generic ("Wi-Fi") while the real interface on
+    # this machine is e.g. "Wi-Fi 4" — using the wrong name silently fails.
+    effective_adapter = adapter_info.name if (adapter_info and adapter_info.name) else adapter_name
 
     congestion = get_channel_congestion(networks)
     _progress("📈 Analyzing channel congestion...")
@@ -425,10 +444,21 @@ def run_optimization(profile_key: str = "balanced",
 
     recommendations = build_recommendations(adapter_info, networks, congestion)
 
-    # Apply settings
-    _progress(f"⚙️ Applying profile: {profile.name}...")
+    # ── Safety: full independent backup of current adapter settings ──────────
+    if adapter_manager.is_admin() and not preview:
+        _progress("🛡️ Backing up current adapter settings...")
+        try:
+            adapter_manager.backup_adapter_settings()
+        except Exception as e:
+            logger.warning("Adapter backup failed (continuing): %s", e)
 
-    if adapter_manager.is_admin():
+    # Apply settings
+    if preview:
+        _progress(f"👀 Preview mode — showing what '{profile.name}' would change...")
+    else:
+        _progress(f"⚙️ Applying profile: {profile.name}...")
+
+    if adapter_manager.is_admin() or preview:
         # Set preferred band
         _progress(f"📶 Setting preferred band: {profile.preferred_band}...")
         if adapter_manager.set_preferred_band(adapter_name, profile.preferred_band):
@@ -475,7 +505,7 @@ def run_optimization(profile_key: str = "balanced",
         # TCP optimization
         if profile.optimize_tcp:
             _progress("🌐 Optimizing TCP settings...")
-            if adapter_manager.optimize_tcp_settings():
+            if adapter_manager.optimize_tcp_settings(effective_adapter):
                 settings_applied.append("TCP/IP settings → Optimized (auto-tuning, RSS, ECN)")
             else:
                 settings_failed.append("TCP optimization")
@@ -484,7 +514,8 @@ def run_optimization(profile_key: str = "balanced",
         if profile.set_dns:
             _progress("🌐 Setting DNS servers...")
             adapter_manager.flush_dns()
-            if adapter_manager.set_dns_servers(profile.dns_primary, profile.dns_secondary, adapter_name):
+            if adapter_manager.set_dns_servers(profile.dns_primary, profile.dns_secondary,
+                                               effective_adapter):
                 settings_applied.append(f"DNS → {profile.dns_primary} / {profile.dns_secondary}")
             else:
                 settings_failed.append("DNS servers")
@@ -497,7 +528,7 @@ def run_optimization(profile_key: str = "balanced",
             settings_applied.append("DNS cache flushed")
 
         if profile.optimize_tcp:
-            adapter_manager.optimize_tcp_settings()
+            adapter_manager.optimize_tcp_settings(effective_adapter)
             settings_applied.append("TCP settings (partial — run as admin for full)")
 
         settings_failed.append("Registry adapter settings (requires admin)")
@@ -510,7 +541,12 @@ def run_optimization(profile_key: str = "balanced",
     else:
         estimated_improvement = "Low — run as Administrator for full optimization"
 
-    _progress("✅ Optimization complete!")
+    if preview:
+        preview_changes = adapter_manager.get_preview_changes()
+        adapter_manager.set_preview_mode(False)
+        _progress(f"✅ Preview complete — {len(preview_changes)} change(s) would be made.")
+    else:
+        _progress("✅ Optimization complete!")
 
     return OptimizationResult(
         profile_name=profile.name,
@@ -523,4 +559,5 @@ def run_optimization(profile_key: str = "balanced",
         adapter_info=adapter_info,
         channel_congestion=congestion,
         recommendations=recommendations,
+        preview_changes=preview_changes,
     )

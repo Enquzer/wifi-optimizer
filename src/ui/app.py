@@ -376,6 +376,53 @@ class WiFiOptimizerApp(ctk.CTk):
             except: pass
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
+        # Fullscreen and Zoom control states
+        self._help_zoom = 1.10
+        self._is_fullscreen = False
+        self.bind("<F11>", lambda e: self._toggle_fullscreen())
+        self.bind("<Control-plus>", lambda e: self._zoom_help_in())
+        self.bind("<Control-equal>", lambda e: self._zoom_help_in())
+        self.bind("<Control-minus>", lambda e: self._zoom_help_out())
+        self.bind("<Control-0>", lambda e: self._reset_help_zoom())
+
+    def _toggle_fullscreen(self):
+        self._is_fullscreen = not getattr(self, '_is_fullscreen', False)
+        if self._is_fullscreen:
+            try:
+                self.state('zoomed')
+            except Exception:
+                self.attributes('-fullscreen', True)
+            if hasattr(self, '_fs_btn'):
+                self._fs_btn.configure(text="🗗 Windowed")
+        else:
+            try:
+                self.state('normal')
+                self.attributes('-fullscreen', False)
+            except Exception:
+                pass
+            if hasattr(self, '_fs_btn'):
+                self._fs_btn.configure(text="🗖 Fullscreen")
+
+    def _zoom_help_in(self):
+        self._help_zoom = min(2.5, round(self._help_zoom + 0.15, 2))
+        self._refresh_help_zoom()
+
+    def _zoom_help_out(self):
+        self._help_zoom = max(0.75, round(self._help_zoom - 0.15, 2))
+        self._refresh_help_zoom()
+
+    def _reset_help_zoom(self):
+        self._help_zoom = 1.10
+        self._refresh_help_zoom()
+
+    def _refresh_help_zoom(self):
+        if hasattr(self, '_zoom_label'):
+            self._zoom_label.configure(text=f"{int(self._help_zoom * 100)}%")
+        if hasattr(self, '_help_scroll'):
+            for w in self._help_scroll.winfo_children():
+                w.destroy()
+            self._render_help_content(self._help_scroll, self._help_zoom)
+
     # ─── Layout ───────────────────────────────────────────────────────────────
     def _build_ui(self):
         # Sidebar
@@ -945,18 +992,75 @@ class WiFiOptimizerApp(ctk.CTk):
         page = ctk.CTkFrame(self._content, fg_color=COLORS["bg"])
         self._pages["help"] = page
 
-        # Header
+        # Header with Title and Zoom / Fullscreen Toolbar
         hdr = ctk.CTkFrame(page, fg_color="transparent")
-        hdr.pack(fill="x", padx=24, pady=(20, 10))
-        ctk.CTkLabel(hdr, text="❓  How It Works & Mathematical Architecture",
-                     font=("Segoe UI", 20, "bold"),
-                     text_color=COLORS["text"]).pack(anchor="w")
-        ctk.CTkLabel(hdr, text="Complete physical formulas, RF radio models, M-BFF scoring equations, NDIS parameters, and kernel optimizations.",
-                     font=("Segoe UI", 11),
-                     text_color=COLORS["text_muted"]).pack(anchor="w", pady=(2, 0))
+        hdr.pack(fill="x", padx=24, pady=(16, 8))
 
-        scroll = ctk.CTkScrollableFrame(page, fg_color=COLORS["bg"], corner_radius=0)
-        scroll.pack(fill="both", expand=True, padx=24, pady=(0, 20))
+        # Title col on left
+        t_col = ctk.CTkFrame(hdr, fg_color="transparent")
+        t_col.pack(side="left", fill="x", expand=True)
+
+        ctk.CTkLabel(t_col, text="❓  How It Works & Mathematical Architecture",
+                     font=("Segoe UI", 18, "bold"),
+                     text_color=COLORS["text"]).pack(anchor="w")
+        ctk.CTkLabel(t_col, text="Complete physical formulas, RF radio models, M-BFF scoring equations, NDIS parameters, and kernel optimizations.",
+                     font=("Segoe UI", 10),
+                     text_color=COLORS["text_muted"]).pack(anchor="w", pady=(1, 0))
+
+        # Toolbar on right: Zoom controls + Fullscreen
+        tb = ctk.CTkFrame(hdr, fg_color=COLORS["surface"], corner_radius=10,
+                          border_width=1, border_color=COLORS["border"])
+        tb.pack(side="right", padx=(10, 0), pady=2)
+
+        self._zoom_out_btn = ctk.CTkButton(
+            tb, text="➖", width=34, height=30,
+            font=("Segoe UI", 12, "bold"),
+            fg_color="transparent", hover_color=COLORS["surface2"],
+            text_color=COLORS["text"], command=self._zoom_help_out)
+        self._zoom_out_btn.pack(side="left", padx=2, pady=2)
+
+        self._zoom_label = ctk.CTkLabel(
+            tb, text=f"{int(self._help_zoom * 100)}%",
+            font=("Segoe UI", 11, "bold"),
+            text_color=COLORS["accent"], width=52)
+        self._zoom_label.pack(side="left", padx=2, pady=2)
+
+        self._zoom_in_btn = ctk.CTkButton(
+            tb, text="➕", width=34, height=30,
+            font=("Segoe UI", 12, "bold"),
+            fg_color="transparent", hover_color=COLORS["surface2"],
+            text_color=COLORS["text"], command=self._zoom_help_in)
+        self._zoom_in_btn.pack(side="left", padx=2, pady=2)
+
+        self._zoom_reset_btn = ctk.CTkButton(
+            tb, text="↺ 100%", width=58, height=28,
+            font=("Segoe UI", 10),
+            fg_color=COLORS["surface2"], hover_color=COLORS["border"],
+            text_color=COLORS["text_muted"], command=self._reset_help_zoom)
+        self._zoom_reset_btn.pack(side="left", padx=(2, 6), pady=2)
+
+        self._fs_btn = ctk.CTkButton(
+            tb, text="🗖 Fullscreen" if not self._is_fullscreen else "🗗 Windowed",
+            width=105, height=28,
+            font=("Segoe UI", 11, "bold"),
+            fg_color=COLORS["accent_glow"], text_color=COLORS["accent"],
+            hover_color=COLORS["border"], command=self._toggle_fullscreen)
+        self._fs_btn.pack(side="left", padx=(0, 4), pady=2)
+
+        self._help_scroll = ctk.CTkScrollableFrame(page, fg_color=COLORS["bg"], corner_radius=0)
+        self._help_scroll.pack(fill="both", expand=True, padx=24, pady=(0, 16))
+
+        self._render_help_content(self._help_scroll, self._help_zoom)
+
+    def _render_help_content(self, scroll, zoom: float):
+        # Scaled font definitions
+        title_font = ("Segoe UI", max(11, int(13 * zoom)), "bold")
+        sub_font = ("Segoe UI", max(9, int(10 * zoom)))
+        form_title_font = ("Segoe UI", max(9, int(10.5 * zoom)), "bold")
+        form_code_font = ("Consolas", max(10, int(11.5 * zoom)), "bold")
+        form_desc_font = ("Segoe UI", max(9, int(9.5 * zoom)))
+        code_font = ("Consolas", max(9, int(9.5 * zoom)))
+        desc_wrap = max(700, int(760 * zoom))
 
         def _help_card(title: str, icon: str, subtitle: str, color=COLORS["accent"]) -> ctk.CTkFrame:
             card = ctk.CTkFrame(scroll, fg_color=COLORS["card"], corner_radius=12,
@@ -965,10 +1069,10 @@ class WiFiOptimizerApp(ctk.CTk):
 
             chdr = ctk.CTkFrame(card, fg_color="transparent")
             chdr.pack(fill="x", padx=16, pady=(12, 4))
-            ctk.CTkLabel(chdr, text=f"{icon}  {title}", font=("Segoe UI", 13, "bold"),
+            ctk.CTkLabel(chdr, text=f"{icon}  {title}", font=title_font,
                          text_color=color).pack(side="left")
 
-            ctk.CTkLabel(card, text=subtitle, font=("Segoe UI", 10),
+            ctk.CTkLabel(card, text=subtitle, font=sub_font,
                          text_color=COLORS["text_muted"]).pack(anchor="w", padx=16, pady=(0, 8))
 
             content_box = ctk.CTkFrame(card, fg_color="transparent")
@@ -979,7 +1083,7 @@ class WiFiOptimizerApp(ctk.CTk):
             c_frame = ctk.CTkFrame(parent, fg_color=COLORS["surface2"], corner_radius=8,
                                    border_width=1, border_color=COLORS["border"])
             c_frame.pack(fill="x", pady=4, padx=4)
-            ctk.CTkLabel(c_frame, text=text, font=("Consolas", 9),
+            ctk.CTkLabel(c_frame, text=text, font=code_font,
                          text_color=COLORS["text"], justify="left", anchor="w").pack(padx=12, pady=8, fill="x")
 
         def _formula_box(parent, title: str, formula: str, desc: str = ""):
@@ -988,14 +1092,14 @@ class WiFiOptimizerApp(ctk.CTk):
             f_frame.pack(fill="x", pady=4, padx=4)
             top = ctk.CTkFrame(f_frame, fg_color="transparent")
             top.pack(fill="x", padx=10, pady=(6, 2))
-            ctk.CTkLabel(top, text=title, font=("Segoe UI", 10, "bold"),
+            ctk.CTkLabel(top, text=title, font=form_title_font,
                          text_color=COLORS["accent"]).pack(side="left")
-            ctk.CTkLabel(f_frame, text=formula, font=("Consolas", 11, "bold"),
+            ctk.CTkLabel(f_frame, text=formula, font=form_code_font,
                          text_color="#F8FAFC", justify="left", anchor="w").pack(padx=12, pady=(0, 4), fill="x")
             if desc:
-                ctk.CTkLabel(f_frame, text=desc, font=("Segoe UI", 9),
+                ctk.CTkLabel(f_frame, text=desc, font=form_desc_font,
                              text_color=COLORS["text_muted"], justify="left", anchor="w",
-                             wraplength=760).pack(padx=12, pady=(0, 6), fill="x")
+                             wraplength=desc_wrap).pack(padx=12, pady=(0, 6), fill="x")
 
         # ── 0. Demystifying Scores: Signal vs. Quality vs. Optimization ───────
         c0 = _help_card(

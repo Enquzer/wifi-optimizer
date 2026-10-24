@@ -1,0 +1,11 @@
+# Keep GitHub language statistics on the actual source, not the bundled
+# PyInstaller runtime (which otherwise makes Tcl look like the primary language).
+app_bin/** linguist-vendored
+dist/** linguist-vendored
+build/** linguist-vendored
+
+# Windows shortcut and packaged binaries are not text.
+*.lnk binary
+*.exe binary
+*.dll binary
+*.pyd binary

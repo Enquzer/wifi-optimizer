@@ -1,236 +1,271 @@
 """
-WiFi Optimizer - Independent Verification Script
-================================================
-Run this BEFORE and AFTER clicking OPTIMIZE in the GUI to objectively
-compare your connection metrics. It reads the same Windows telemetry
-(netsh + native RSSI) that the optimizer uses, so you can verify
-real changes vs. faked numbers.
+WiFi Optimizer - Independent Verification
+=========================================
 
-Usage:
-    python scripts\verify_optimization.py before
-    ...then run OPTIMIZE in the GUI...
-    python scripts\verify_optimization.py after
+Measures the live link with real telemetry (Native Wi-Fi API) and a real
+download/RTT benchmark, then compares a before/after pair.
 
-It prints a side-by-side comparison and checks the optimizer log
-and rollback snapshot to confirm which settings were actually applied.
+    python scripts/verify_optimization.py before
+    ... run the optimizer ...
+    python scripts/verify_optimization.py after
+
+The tool prints measured values and deltas. It does not invent an
+"improvement percentage". A single sample is noisy: use --reps 3 for the
+benchmark, and repeat the whole before/after pair if the deltas are small.
+
+Options:
+    --bytes N        download size per sample (default 8,000,000)
+    --samples N      TCP-connect latency samples (default 20)
+    --reps N         benchmark repetitions; medians are compared (default 1)
+    --no-benchmark   telemetry only (fast)
 """
 
-import sys
-import os
+import argparse
 import json
-import subprocess
-import ctypes
+import os
+import sys
 from datetime import datetime
 
-# Ensure src is importable so we reuse the tool's own scanner logic
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC_DIR = os.path.join(BASE_DIR, "src")
 if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
-LOG_FILE = os.path.join(BASE_DIR, "wifi_optimizer.log")
-SNAPSHOT_FILE = os.path.join(SRC_DIR, "core", "adapter_rollback_snapshot.json")
+from core import adapter_manager, benchmark  # noqa: E402
+from core.wifi_scanner import get_connected_network, scan_networks  # noqa: E402
+
+STATE_FILE = os.path.join(BASE_DIR, "verify_before.json")
+ROLLBACK_FILE = os.path.join(SRC_DIR, "core", "adapter_rollback_snapshot.json")
+SYSTEM_SNAPSHOT = os.path.join(SRC_DIR, "core", "system_rollback_snapshot.json")
 
 
-def is_admin() -> bool:
+def _admin() -> bool:
     try:
-        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
     except Exception:
         return False
 
 
-def run(cmd):
+def _read_json(path):
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=15,
-                           creationflags=subprocess.CREATE_NO_WINDOW
-                           if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0)
-        return r.stdout.strip(), r.returncode == 0
-    except Exception as e:
-        return str(e), False
-
-
-def capture_netsh_interfaces():
-    out, ok = run(["netsh", "wlan", "show", "interfaces"])
-    return out, ok
-
-
-def capture_netsh_networks():
-    out, ok = run(["netsh", "wlan", "show", "networks", "mode=bssid"])
-    return out, ok
-
-
-def parse_interface_block(text):
-    """Pull key fields out of 'netsh wlan show interfaces' output."""
-    fields = {}
-    for line in text.splitlines():
-        ls = line.strip()
-        if ":" not in ls:
-            continue
-        key, _, val = ls.partition(":")
-        key = key.strip().lower()
-        val = val.strip()
-        mapping = {
-            "name": "name",
-            "description": "description",
-            "ssid": "ssid",
-            "bssid": "bssid",
-            "network type": "network_type",
-            "authentication": "authentication",
-            "cipher": "cipher",
-            "connection mode": "connection_mode",
-            "channel": "channel",
-            "receive rate": "receive_rate_mbps",
-            "transmit rate": "transmit_rate_mbps",
-            "signal": "signal_percent",
-            "profile": "profile",
-            "radio type": "radio_type",
-        }
-        if key in mapping:
-            fields[mapping[key]] = val
-    return fields
-
-
-def read_tail_log(lines=30):
-    if not os.path.exists(LOG_FILE):
-        return None
-    try:
-        with open(LOG_FILE, "r", encoding="utf-8") as f:
-            all_lines = f.readlines()
-        return "".join(all_lines[-lines:])
-    except Exception as e:
-        return f"(could not read log: {e})"
-
-
-def read_rollback_snapshot():
-    if not os.path.exists(SNAPSHOT_FILE):
-        return None
-    try:
-        with open(SNAPSHOT_FILE, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-    except Exception as e:
-        return f"(could not read snapshot: {e})"
+    except Exception:
+        return None
 
 
-def print_section(title):
-    print(f"\n{'='*70}\n{title}\n{'='*70}")
-
-
-def mode_before():
-    print_section("BEFORE OPTIMIZATION SNAPSHOT")
-    print(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"Running as Administrator: {is_admin()}")
-    if not is_admin():
-        print("  [!] WARNING: Not running as Admin. Registry/hardware settings will NOT apply.")
-        print("      Only DNS flush / partial TCP will work. Right-click the app -> 'Run as Administrator'.")
-
-    out, ok = capture_netsh_interfaces()
-    print("\n--- netsh wlan show interfaces ---")
-    print(out if out else "(no output)")
-
-    fields = parse_interface_block(out)
-    print("\n--- Parsed key metrics ---")
-    for k in ["ssid", "channel", "receive_rate_mbps", "transmit_rate_mbps",
-              "signal_percent", "authentication", "radio_type", "profile"]:
-        print(f"  {k}: {fields.get(k, '—')}")
-
-    out2, _ = capture_netsh_networks()
-    net_count = out2.count("SSID")
-    print(f"\nVisible networks (SSID count): {net_count}")
-
-    # Save to file so 'after' mode can compare
+def capture(args, with_benchmark: bool) -> dict:
+    adapter = get_connected_network()
+    networks = scan_networks()
     data = {
         "time": datetime.now().isoformat(),
-        "admin": is_admin(),
-        "interfaces": out,
-        "networks_count": net_count,
-        "parsed": fields,
+        "admin": _admin(),
+        "adapter": adapter.__dict__ if adapter else None,
+        "bss_count": len(networks),
+        "bands": sorted({n.band for n in networks}),
+        "benchmark": None,
     }
-    with os.fdopen(os.open(os.path.join(BASE_DIR, "verify_before.json"),
-                           os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644), "w") as f:
+    if with_benchmark:
+        if args.reps > 1:
+            data["benchmark"] = benchmark.measure_median(
+                reps=args.reps, download_bytes=args.bytes,
+                latency_samples=args.samples)
+        else:
+            data["benchmark"] = benchmark.measure(
+                download_bytes=args.bytes,
+                latency_samples=args.samples).to_dict()
+    return data
+
+
+def _fmt(value, unit="", digits=1):
+    if value is None:
+        return "—"
+    try:
+        return f"{float(value):.{digits}f}{unit}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _delta(before, after, unit="", digits=1, lower_is_better=False):
+    if before is None or after is None:
+        return "—"
+    try:
+        diff = float(after) - float(before)
+    except (TypeError, ValueError):
+        return "—"
+    if abs(diff) < 10 ** (-digits) / 2:
+        return "unchanged"
+    good = (diff < 0) if lower_is_better else (diff > 0)
+    sign = "+" if diff > 0 else ""
+    return f"{sign}{diff:.{digits}f}{unit} {'better' if good else 'worse'}"
+
+
+def print_telemetry(data: dict):
+    a = data.get("adapter") or {}
+    print(f"  SSID / BSSID       : {a.get('ssid', '—')} / {a.get('bssid', '—')}")
+    print(f"  RSSI / quality     : {_fmt(a.get('signal_dbm'), ' dBm', 0)} / {a.get('signal_percent', '—')}%")
+    print(f"  Band / channel     : {a.get('band', '—')} / {a.get('channel', '—')}")
+    print(f"  PHY (rx / tx)      : {_fmt(a.get('receive_rate_mbps'), ' Mbps', 0)} / "
+          f"{_fmt(a.get('transmit_rate_mbps'), ' Mbps', 0)}")
+    print(f"  Security           : {a.get('authentication', '—')} / {a.get('cipher', '—')}")
+    print(f"  Driver             : {a.get('description', '—')}")
+    print(f"  Visible BSSes      : {data.get('bss_count', 0)}  bands={data.get('bands', [])}")
+    print(f"  Administrator      : {data.get('admin')}")
+
+
+def print_benchmark(b: dict, indent: str = "  "):
+    if not b:
+        print(f"{indent}(benchmark skipped)")
+        return
+    print(f"{indent}download           : {_fmt(b.get('throughput_mbps'), ' Mbps', 2)}")
+    print(f"{indent}RTT median / p95   : {_fmt(b.get('latency_median_ms'), ' ms', 0)} / "
+          f"{_fmt(b.get('latency_p95_ms'), ' ms', 0)}")
+    print(f"{indent}jitter / loss      : {_fmt(b.get('jitter_ms'), ' ms', 0)} / "
+          f"{_fmt(b.get('loss_pct'), ' %', 1)}")
+    print(f"{indent}DNS                : {_fmt(b.get('dns_ms'), ' ms', 1)}")
+    eff = b.get("efficiency")
+    print(f"{indent}efficiency         : {_fmt(eff * 100 if eff is not None else None, '% of PHY', 0)}")
+    if b.get("reps"):
+        print(f"{indent}repetitions        : {b['reps']} (median shown)")
+    if b.get("errors"):
+        print(f"{indent}errors             : {b['errors']}")
+
+
+def mode_before(args):
+    print("=" * 72)
+    print("BEFORE — baseline snapshot")
+    print("=" * 72)
+    data = capture(args, not args.no_benchmark)
+    print_telemetry(data)
+    print("\nMeasured link:")
+    print_benchmark(data.get("benchmark"))
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
-    print("\nSaved baseline to verify_before.json")
+    print(f"\nSaved baseline to {STATE_FILE}")
+    if not data.get("admin"):
+        print("[!] Not elevated: NDIS/registry settings cannot be applied. "
+              "Run the app as Administrator for the full set.")
 
 
-def mode_after():
-    print_section("AFTER OPTIMIZATION SNAPSHOT")
-    print(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"Running as Administrator: {is_admin()}")
+def mode_after(args):
+    print("=" * 72)
+    print("AFTER — measurement and comparison")
+    print("=" * 72)
+    before = _read_json(STATE_FILE)
+    if not before:
+        print(f"No baseline at {STATE_FILE}. Run 'before' first.")
+        return 2
 
-    # Load before baseline
-    before_path = os.path.join(BASE_DIR, "verify_before.json")
-    before = None
-    if os.path.exists(before_path):
+    data = capture(args, not args.no_benchmark)
+    print("Current link:")
+    print_telemetry(data)
+    print("\nCurrent measurement:")
+    print_benchmark(data.get("benchmark"))
+
+    print("\n" + "-" * 72)
+    print("BEFORE → AFTER")
+    print("-" * 72)
+    ba = before.get("adapter") or {}
+    aa = data.get("adapter") or {}
+    for key, unit, digits, lower in (
+        ("signal_dbm", " dBm", 0, False),
+        ("signal_percent", "%", 0, False),
+        ("channel", "", 0, False),
+        ("receive_rate_mbps", " Mbps", 0, False),
+        ("transmit_rate_mbps", " Mbps", 0, False),
+    ):
+        b = ba.get(key)
+        a = aa.get(key)
+        print(f"  {key:20s} {_fmt(b, unit, digits):>14s} → {_fmt(a, unit, digits):<14s} "
+              f"{_delta(b, a, unit, digits, lower)}")
+
+    bb = before.get("benchmark") or {}
+    ab = data.get("benchmark") or {}
+    if bb and ab:
+        print()
+        for key, unit, digits, lower in (
+            ("throughput_mbps", " Mbps", 2, False),
+            ("latency_median_ms", " ms", 0, True),
+            ("latency_p95_ms", " ms", 0, True),
+            ("jitter_ms", " ms", 0, True),
+            ("loss_pct", " %", 1, True),
+        ):
+            b = bb.get(key)
+            a = ab.get(key)
+            print(f"  {key:20s} {_fmt(b, unit, digits):>14s} → {_fmt(a, unit, digits):<14s} "
+                  f"{_delta(b, a, unit, digits, lower)}")
+        be, ae = bb.get("efficiency"), ab.get("efficiency")
+        print(f"  {'efficiency':20s} {_fmt(be*100 if be is not None else None, '%', 0):>14s} → "
+              f"{_fmt(ae*100 if ae is not None else None, '%', 0):<14s}")
+        print("\nNote: throughput and RTT are noisy. Treat a change smaller than "
+              "~15% (or any single run) as inconclusive; repeat with --reps 3.")
+    else:
+        print("\n(No benchmark data — rerun without --no-benchmark to compare "
+              "throughput and latency.)")
+
+    print("\n" + "-" * 72)
+    print("REGISTRY CHANGES RECORDED SINCE THE BASELINE")
+    print("-" * 72)
+    snap = _read_json(ROLLBACK_FILE)
+    if not snap:
+        print("  No registry snapshot (no changes, preview mode, or not elevated).")
+    else:
+        # The snapshot file is historical. Only entries written after the
+        # baseline, for adapters that still exist, are relevant to this pair.
         try:
-            with open(before_path, "r", encoding="utf-8") as f:
-                before = json.load(f)
+            baseline_epoch = datetime.fromisoformat(before["time"]).timestamp()
         except Exception:
-            pass
+            baseline_epoch = 0.0
+        try:
+            active = {a["subkey"] for a in adapter_manager.find_active_wifi_adapters()}
+        except Exception:
+            active = set()
+        fresh = [
+            e for e in snap
+            if (not active or e.get("subkey") in active)
+            and float(e.get("timestamp", 0) or 0) >= baseline_epoch - 5
+        ]
+        stale = len(snap) - len(fresh)
+        if not fresh:
+            print("  No new registry changes since the baseline "
+                  f"({stale} historical/stale entr{'y' if stale == 1 else 'ies'} ignored).")
+        else:
+            print(f"  {len(fresh)} change(s); {stale} historical/stale ignored:")
+            for e in fresh[-25:]:
+                print(f"    [{e.get('subkey', '?')}] {e.get('property', '?')} = "
+                      f"{e.get('new_value', '?')} (existed={e.get('existed')})")
 
-    out, ok = capture_netsh_interfaces()
-    print("\n--- netsh wlan show interfaces ---")
-    print(out if out else "(no output)")
-    fields = parse_interface_block(out)
+    sys_snap = _read_json(SYSTEM_SNAPSHOT)
+    if sys_snap:
+        print("  System snapshot:")
+        print(f"    DNS={sys_snap.get('dns_v4')}  "
+              f"power={sys_snap.get('wireless_power')}  "
+              f"TCP={sys_snap.get('tcp')}")
 
-    print("\n--- Before vs After Comparison ---")
-    if before:
-        bf = before.get("parsed", {})
-        keys = ["ssid", "channel", "receive_rate_mbps", "transmit_rate_mbps",
-                "signal_percent", "authentication", "radio_type"]
-        changed_any = False
-        for k in keys:
-            b = bf.get(k, "—")
-            a = fields.get(k, "—")
-            marker = "  <CHANGED>" if str(b) != str(a) else ""
-            if marker:
-                changed_any = True
-            print(f"  {k:24s} before={str(b):18s} after={str(a):18s}{marker}")
-        if not changed_any:
-            print("  [No metric changed in netsh output.]")
-    else:
-        print("  (No baseline found. Run 'before' mode first.)")
-        for k in ["ssid", "channel", "receive_rate_mbps", "transmit_rate_mbps",
-                  "signal_percent", "authentication", "radio_type"]:
-            print(f"  {k}: {fields.get(k, '—')}")
-
-    # Check optimizer log
-    print_section("OPTIMIZER LOG (tail)")
-    log = read_tail_log(40)
-    print(log if log else "(no log file found)")
-
-    # Check rollback snapshot
-    print_section("ROLLBACK SNAPSHOT (registry keys actually touched)")
-    snap = read_rollback_snapshot()
-    if snap is None:
-        print("(no snapshot file — either no changes applied, dry-run, or not admin)")
-    elif isinstance(snap, str):
-        print(snap)
-    elif not snap:
-        print("(snapshot is empty — no registry keys were modified)")
-    else:
-        print(f"Total entries: {len(snap)}")
-        for e in snap[-20:]:
-            print(f"  [{e.get('subkey','?')}] {e.get('property','?')} = {e.get('new_value','?')} "
-                  f"(existed_before={e.get('existed')})")
-
-    out2, _ = capture_netsh_networks()
-    net_count = out2.count("SSID")
-    print(f"\nVisible networks (SSID count): {net_count}")
+    return 0
 
 
 def main():
-    if len(sys.argv) < 2 or sys.argv[1].lower() not in ("before", "after"):
-        print("Usage: python scripts\\verify_optimization.py [before|after]")
-        print("\nSteps:")
-        print("  1. Run this script with 'before'")
-        print("  2. Open WiFi Optimizer (as Administrator) and click OPTIMIZE NOW")
-        print("  3. Run this script again with 'after' to compare")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="Measure before/after Wi-Fi changes")
+    parser.add_argument("mode", choices=["before", "after"])
+    parser.add_argument("--bytes", type=int, default=8_000_000)
+    parser.add_argument("--samples", type=int, default=20)
+    parser.add_argument("--reps", type=int, default=1)
+    parser.add_argument("--no-benchmark", action="store_true")
+    args = parser.parse_args()
 
-    if sys.argv[1].lower() == "before":
-        mode_before()
-    else:
-        mode_after()
+    if args.mode == "before":
+        mode_before(args)
+        return 0
+    return mode_after(args)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

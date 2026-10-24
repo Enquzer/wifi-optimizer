@@ -1,118 +1,148 @@
 """
-WiFi Optimizer - Core Optimization Algorithm
-Analyzes scanned networks and applies the best settings for maximum performance.
+WiFi Optimizer - Core Optimization Engine
+=========================================
+
+The engine is deliberately modest about what a client can change:
+
+* It can pick the best visible BSS and configure the *client* adapter.
+* It cannot raise the router's transmit power, change the router's antenna, or
+  make a weak signal strong. Those are physics / AP-side decisions.
+* Every reported "changed" setting is read back from the registry or system
+  API; unchanged values are reported separately instead of being counted as
+  wins. There is no fabricated percentage improvement.
+
+The important new lever for far-from-router situations is the robustness
+profile: force a 20 MHz channel, prefer 2.4 GHz, minimise roaming, disable
+power save, and reload the miniport so the values actually take effect.
 """
+
+from __future__ import annotations
 
 import logging
 import math
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
-from core.wifi_scanner import WiFiNetwork, AdapterInfo, scan_networks, get_connected_network, get_channel_congestion
+from typing import Dict, List, Optional, Tuple
+
 from core import adapter_manager
+from core.wifi_scanner import (
+    AdapterInfo, WiFiNetwork, get_channel_congestion, get_connected_network,
+    get_saved_wifi_profiles, scan_networks,
+)
 
 logger = logging.getLogger(__name__)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Profiles
+# ─────────────────────────────────────────────────────────────────────────────
 @dataclass
 class OptimizationProfile:
-    """Optimization target profile."""
+    """What the client side is allowed to do for a given goal."""
     name: str
     description: str
     preferred_band: str          # "5GHz", "2.4GHz", "Auto"
-    roaming_aggressiveness: int  # 1-5 (5=most aggressive)
-    transmit_power: int          # 1-5 (5=max)
+    roaming_aggressiveness: int  # 1-5 (5 = most aggressive)
+    transmit_power: int          # 1-5 (5 = max)
     disable_power_save: bool
     background_scan: bool
     optimize_tcp: bool
     set_dns: bool
     dns_primary: str
     dns_secondary: str
-    allow_insecure_networks: bool = False  # Hard security gate: disallow Open and WEP
-    require_saved_profile: bool = False    # Roaming filter: only recommend networks already configured
+    allow_insecure_networks: bool = False
+    require_saved_profile: bool = False
+    channel_width_24: str = "auto"   # "20MHz" | "auto"
+    channel_width_52: str = "auto"
+    latency_tweaks: bool = False     # U-APSD off, packet coalescing off, etc.
+    ecn: bool = False                # opt-in TCP ECN
+    restart_adapter: bool = True     # reload miniport so registry values apply
 
 
-PROFILES = {
+PROFILES: Dict[str, OptimizationProfile] = {
+    "far_range": OptimizationProfile(
+        name="Far / Robust",
+        description=(
+            "For weak/far links: 20 MHz width, 2.4 GHz, minimum roaming, no power "
+            "save. Trades peak speed for a link that survives retries."
+        ),
+        preferred_band="2.4GHz",
+        roaming_aggressiveness=1,
+        transmit_power=5,
+        disable_power_save=True,
+        background_scan=False,
+        optimize_tcp=False,
+        set_dns=False,
+        dns_primary="1.1.1.1",
+        dns_secondary="1.0.0.1",
+        channel_width_24="20MHz",
+        channel_width_52="20MHz",
+        latency_tweaks=False,
+        ecn=False,
+    ),
     "max_speed": OptimizationProfile(
         name="Max Speed",
-        description="Maximum throughput — best for gaming, streaming, downloads",
+        description="Highest throughput when the signal is already good (5/6 GHz).",
         preferred_band="5GHz",
         roaming_aggressiveness=3,
         transmit_power=5,
         disable_power_save=True,
-        background_scan=True,
+        background_scan=False,
         optimize_tcp=True,
-        set_dns=True,
-        dns_primary="8.8.8.8",
-        dns_secondary="8.8.4.4",
-        allow_insecure_networks=False,
-        require_saved_profile=False,
-    ),
-    "selfish": OptimizationProfile(
-        name="Selfish Dominant",
-        description="Airtime priority — forces adapter to claim channel priority over other devices",
-        preferred_band="Auto",
-        roaming_aggressiveness=5,
-        transmit_power=5,
-        disable_power_save=True,
-        background_scan=True,
-        optimize_tcp=True,
-        set_dns=True,
-        dns_primary="1.1.1.1",
-        dns_secondary="8.8.8.8",
-        allow_insecure_networks=False,
-        require_saved_profile=False,
-    ),
-    "max_range": OptimizationProfile(
-        name="Max Range",
-        description="Maximum range — best for far distances from router",
-        preferred_band="2.4GHz",
-        roaming_aggressiveness=5,
-        transmit_power=5,
-        disable_power_save=True,
-        background_scan=True,
-        optimize_tcp=True,
-        set_dns=True,
+        set_dns=False,
         dns_primary="1.1.1.1",
         dns_secondary="1.0.0.1",
-        allow_insecure_networks=False,
-        require_saved_profile=False,
+        channel_width_24="auto",
+        channel_width_52="auto",
+        latency_tweaks=True,
+        ecn=False,
     ),
     "balanced": OptimizationProfile(
         name="Balanced",
-        description="Balance speed and range — good for most situations",
+        description="Prefer 5 GHz when it is usable, otherwise keep a stable 2.4 GHz link.",
         preferred_band="Auto",
-        roaming_aggressiveness=3,
+        roaming_aggressiveness=2,
         transmit_power=5,
         disable_power_save=True,
-        background_scan=True,
+        background_scan=False,
         optimize_tcp=True,
-        set_dns=True,
+        set_dns=False,
         dns_primary="1.1.1.1",
-        dns_secondary="8.8.8.8",
-        allow_insecure_networks=False,
-        require_saved_profile=False,
+        dns_secondary="1.0.0.1",
+        channel_width_24="auto",
+        channel_width_52="auto",
+        latency_tweaks=False,
+        ecn=False,
     ),
     "power_save": OptimizationProfile(
         name="Power Saver",
-        description="Minimize power consumption — best for laptops on battery",
+        description="Battery first. Accepts higher latency and lower throughput.",
         preferred_band="2.4GHz",
-        roaming_aggressiveness=1,
+        roaming_aggressiveness=3,
         transmit_power=2,
         disable_power_save=False,
         background_scan=False,
         optimize_tcp=False,
         set_dns=False,
-        dns_primary="8.8.8.8",
-        dns_secondary="8.8.4.4",
-        allow_insecure_networks=False,
-        require_saved_profile=False,
+        dns_primary="1.1.1.1",
+        dns_secondary="1.0.0.1",
+        channel_width_24="auto",
+        channel_width_52="auto",
+        latency_tweaks=False,
+        ecn=False,
     ),
 }
 
+# Backwards compatibility for scripts/UI state that still says "max_range" or
+# "selfish". Both now mean the honest far/robust profile.
+PROFILES["max_range"] = PROFILES["far_range"]
+PROFILES["selfish"] = PROFILES["far_range"]
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Scoring (kept simple and explainable)
+# ─────────────────────────────────────────────────────────────────────────────
 @dataclass
 class NetworkScore:
-    """Scoring result for a WiFi network."""
     network: WiFiNetwork
     signal_score: float     # 0-30
     channel_score: float    # 0-20
@@ -121,14 +151,12 @@ class NetworkScore:
     speed_score: float      # 0-20
     total_score: float      # 0-100
     recommendation: str
-    is_eligible: bool = True               # True security gate: False excludes AP from recommendation
-    ineligibility_reason: str = ""         # Reason if disqualified by policy
-
+    is_eligible: bool = True
+    ineligibility_reason: str = ""
 
 
 @dataclass
 class OptimizationResult:
-    """Result of an optimization run."""
     profile_name: str
     networks_found: int
     best_network: Optional[WiFiNetwork]
@@ -140,26 +168,26 @@ class OptimizationResult:
     channel_congestion: dict
     recommendations: List[str]
     preview_changes: List[dict] = field(default_factory=list)
+    settings_unchanged: List[str] = field(default_factory=list)
+    settings_skipped: List[str] = field(default_factory=list)
+    restart_message: str = ""
+    measured: Optional[dict] = None
 
 
 def calculate_sig_score(dbm: float) -> float:
     """
-    Sigmoid curve for signal strength score (0-30 pts):
-    f_sig(P_rx) = 30 / (1 + exp(-0.35 * (P_rx + 72)))
-    Inflection point at -72 dBm (15 pts).
-    Near saturation at >= -55 dBm (~30 pts).
-    Steep cliff below -75 dBm down to ~0.05 pts at -90 dBm.
+    Logistic score for signal strength, 0-30 points, inflection at -72 dBm.
+    This is a UI heuristic, not a calibrated throughput predictor.
     """
     try:
-        exp_val = math.exp(-0.35 * (dbm + 72.0))
-        return 30.0 / (1.0 + exp_val)
+        return 30.0 / (1.0 + math.exp(-0.35 * (dbm + 72.0)))
     except OverflowError:
         return 0.0 if dbm < -72.0 else 30.0
 
 
 def parse_radio_rank(radio_str: str) -> float:
-    """Map radio type string to PHY score (0-20 pts)."""
-    r = radio_str.lower()
+    """Map a PHY name to a 0-20 capacity score."""
+    r = (radio_str or "").lower()
     if "802.11be" in r or "wi-fi 7" in r or "wifi 7" in r:
         return 20.0
     if "802.11ax" in r or "wi-fi 6" in r or "wifi 6" in r or "wi-fi6" in r:
@@ -168,9 +196,7 @@ def parse_radio_rank(radio_str: str) -> float:
         return 14.0
     if "802.11n" in r or "wi-fi 4" in r or "wifi 4" in r:
         return 9.0
-    if "802.11g" in r:
-        return 4.0
-    if "802.11a" in r:
+    if "802.11g" in r or "802.11a" in r:
         return 4.0
     if "802.11b" in r:
         return 1.0
@@ -182,109 +208,86 @@ def score_network(network: WiFiNetwork, congestion: dict,
                   all_networks: Optional[List[WiFiNetwork]] = None,
                   adapter_info: Optional[AdapterInfo] = None,
                   is_current_connected: bool = False,
-                  saved_profiles: Optional[List[str]] = None,
-                  bss_load_utilization: float = 0.0) -> NetworkScore:
+                  saved_profiles: Optional[List[str]] = None) -> NetworkScore:
     """
-    Score a WiFi network using the Multi-Objective BSSID Fitness Function (M-BFF).
-    S(N) = f_sig(P_rx) + f_cong(C) + f_band(B, P_rx) + f_phy(R) + f_sec(A)
-    Includes hard security policy gating and saved profile filtering.
+    Score a BSS with an explicit, reproducible weighted sum:
+        S = signal(30) + channel(20) + band(20) + PHY(20) + security(10)
+
+    The old code called this "M-BFF" and multiplied by an unused BSS-load
+    utilisation parameter that was always zero. That parameter is gone.
     """
     from core.wifi_scanner import calculate_effective_channel_congestion
 
-    # 1. Signal Strength Score (0-30 pts) - Continuous Sigmoid
-    signal_score = calculate_sig_score(network.signal_dbm)
-    signal_score = max(0.0, min(30.0, signal_score))
+    signal_score = max(0.0, min(30.0, calculate_sig_score(network.signal_dbm)))
 
-    # 2. Channel Congestion Score (0-20 pts)
-    # Penalizes co-channel and adjacent-channel interference scaled by BSS Load (u)
     if all_networks:
         c_eff = calculate_effective_channel_congestion(network, all_networks)
     else:
-        # Fallback to simple channel count if full list not provided
-        c_eff = max(0.0, float(congestion.get(network.channel, 1) - 1))
+        c_eff = max(0.0, float(congestion.get((network.band, network.channel), 1) - 1))
+    channel_score = max(0.0, min(20.0, 20.0 - 5.0 * c_eff))
 
-    u = max(0.0, min(1.0, bss_load_utilization))
-    channel_score = max(0.0, 20.0 - 5.0 * c_eff) * (1.0 - u)
-    channel_score = max(0.0, min(20.0, channel_score))
-
-    # 3. Band Matching Score (0-20 pts)
-    if profile.preferred_band == "5GHz" or profile.name == "Max Speed":
+    if profile.preferred_band == "5GHz":
         g = 1.0 if network.band == "6GHz" else (0.95 if network.band == "5GHz" else 0.35)
-    elif profile.preferred_band == "2.4GHz" or profile.name == "Max Range":
+    elif profile.preferred_band == "2.4GHz":
         g = 1.0 if network.band == "2.4GHz" else (0.6 if network.band == "5GHz" else 0.5)
-    else:  # Balanced / Selfish / Auto
+    else:
         g = 1.0 if network.band == "6GHz" else (0.9 if network.band == "5GHz" else 0.5)
 
-    # Link margin distance attenuation factor h(P_rx)
+    # Link-margin taper: high bands need more signal to be usable.
     if network.band in ("5GHz", "6GHz"):
         h = max(0.1, min(1.0, (network.signal_dbm + 80.0) / 15.0))
     else:
         h = max(0.1, min(1.0, (network.signal_dbm + 95.0) / 20.0))
+    band_score = max(0.0, min(20.0, 20.0 * g * h))
 
-    band_score = 20.0 * g * h
-    band_score = max(0.0, min(20.0, band_score))
-
-    # 4. Security Score (0-10 pts) and Security Policy Gating
-    auth = network.authentication.lower()
-    enc = network.encryption.lower()
-    is_open = ("open" in auth or auth == "")
-    is_wep = ("wep" in auth)
+    auth = (network.authentication or "").lower()
+    enc = (network.encryption or "").lower()
+    is_open = network.authentication == "Open" or "open" in auth
+    is_wep = "wep" in auth or "wep" in enc
 
     if "wpa3" in auth:
         security_score = 10.0
-    elif "wpa2" in auth or "wpa-2" in auth:
-        if "tkip" in enc:
-            security_score = 3.0
-        else:
-            security_score = 8.0
+    elif "wpa2" in auth:
+        security_score = 3.0 if "tkip" in enc else 8.0
     elif "wpa" in auth:
         security_score = 3.0
     elif is_wep or is_open:
         security_score = 0.0
     else:
+        # Unknown (e.g. an unparsed enterprise IE): do not claim it is secure.
         security_score = 2.0
 
-    # Policy Gating
-    is_eligible = True
-    ineligibility_reason = ""
-
+    is_eligible, ineligibility_reason = True, ""
     if (is_open or is_wep) and not profile.allow_insecure_networks:
         is_eligible = False
-        ineligibility_reason = (
-            "Excluded by Security Policy: Plaintext Open network" if is_open
-            else "Excluded by Security Policy: Broken WEP RC4 cipher"
-        )
-
+        ineligibility_reason = ("Excluded by security policy: open network"
+                                if is_open else
+                                "Excluded by security policy: WEP")
     if profile.require_saved_profile and saved_profiles is not None:
         if network.ssid not in saved_profiles:
             is_eligible = False
-            ineligibility_reason = f"Excluded by Policy: SSID '{network.ssid}' is not in saved profiles."
+            ineligibility_reason = f"SSID '{network.ssid}' is not a saved profile"
 
-    # 5. PHY / Radio Tech Score (0-20 pts)
     ap_phy = parse_radio_rank(network.radio_type)
-    if adapter_info and adapter_info.radio_type:
-        adapter_phy = parse_radio_rank(adapter_info.radio_type)
-        speed_score = min(ap_phy, adapter_phy)
-    else:
-        speed_score = ap_phy
+    speed_score = min(ap_phy, parse_radio_rank(adapter_info.radio_type)) if (
+        adapter_info and adapter_info.radio_type) else ap_phy
     speed_score = max(0.0, min(20.0, speed_score))
 
-    total = signal_score + channel_score + band_score + security_score + speed_score
-    total = max(0.0, min(100.0, total))
+    total = max(0.0, min(100.0, signal_score + channel_score + band_score
+                        + security_score + speed_score))
 
-    # Recommendation text
     if not is_eligible:
         recommendation = f"Disqualified — {ineligibility_reason}"
     elif total >= 80:
-        recommendation = "Excellent — optimal link margin and capacity"
+        recommendation = "Excellent — strong link margin"
     elif total >= 60:
         recommendation = "Good — stable connection"
     elif total >= 40:
-        recommendation = "Fair — acceptable link margin"
+        recommendation = "Fair — usable, but retries likely"
     elif total >= 20:
-        recommendation = "Weak — high retransmission probability"
+        recommendation = "Weak — expect retransmissions"
     else:
-        recommendation = "Poor — marginal link near sensitivity threshold"
+        recommendation = "Poor — near the sensitivity limit"
 
     network.score = round(total, 2)
     return NetworkScore(
@@ -304,249 +307,312 @@ def score_network(network: WiFiNetwork, congestion: dict,
 def should_roam_decision(current_score: float, candidate_score: float,
                          last_roam_timestamp: float, current_timestamp: float,
                          hysteresis_threshold: float = 10.0,
-                         cooldown_sec: float = 30.0) -> tuple[bool, str]:
-    """
-    Hysteresis and cooldown gate for AP selection:
-    Prevents ping-pong / flapping across adjacent BSSIDs.
-    - Requires candidate score > current score + hysteresis_threshold
-    - Requires elapsed time >= cooldown_sec
-    """
+                         cooldown_sec: float = 30.0) -> Tuple[bool, str]:
+    """Hysteresis + cooldown gate to prevent BSS ping-pong."""
     elapsed = current_timestamp - last_roam_timestamp
     if elapsed < cooldown_sec:
         return False, f"Cooldown active ({cooldown_sec - elapsed:.1f}s remaining)"
-
     delta = candidate_score - current_score
     if delta < hysteresis_threshold:
-        return False, f"Delta {delta:.1f} pts below hysteresis margin (+{hysteresis_threshold:.1f} pts required)"
-
-    return True, f"Eligible: Candidate exceeds current link by {delta:.1f} pts"
-
+        return False, (f"Delta {delta:.1f} pts below hysteresis margin "
+                       f"(+{hysteresis_threshold:.1f} pts required)")
+    return True, f"Eligible: candidate exceeds current link by {delta:.1f} pts"
 
 
 def auto_select_profile(adapter_info: Optional[AdapterInfo],
                         networks: List[WiFiNetwork]) -> str:
-    """
-    Automatically select the best optimization profile based on
-    current signal strength and available networks.
-    """
-    if not adapter_info or adapter_info.signal_percent < 30:
-        return "max_range"  # Weak signal — optimize for range
-
+    """Pick a starting profile from signal and available bands."""
+    if not adapter_info:
+        return "balanced"
+    # Use real dBm when available; the percentage is driver-defined.
+    if adapter_info.signal_dbm <= -75 or adapter_info.signal_percent < 35:
+        return "far_range"
     has_5ghz = any(n.band == "5GHz" for n in networks)
-    if has_5ghz and adapter_info.signal_percent >= 60:
-        return "max_speed"  # Good signal + 5GHz available
-
+    if has_5ghz and adapter_info.signal_dbm >= -67:
+        return "max_speed"
     return "balanced"
 
 
 def build_recommendations(adapter_info: Optional[AdapterInfo],
-                           networks: List[WiFiNetwork],
-                           congestion: dict) -> List[str]:
-    """Generate human-readable recommendations."""
-    recs = []
-
+                          networks: List[WiFiNetwork],
+                          congestion: dict) -> List[str]:
+    """Human-readable, honest advice."""
+    recs: List[str] = []
     if not adapter_info:
-        recs.append("⚠️ No active WiFi connection detected.")
-        return recs
+        return ["⚠️ No active Wi-Fi connection detected."]
 
-    # Signal quality
-    if adapter_info.signal_percent < 30:
-        recs.append("📍 Move closer to your router — signal is very weak.")
-    elif adapter_info.signal_percent < 60:
-        recs.append("📶 Signal is moderate. Moving closer will improve speed.")
+    dbm = adapter_info.signal_dbm
+    if dbm <= -80:
+        recs.append("📍 Very weak signal (≤ -80 dBm). Move closer, or add a mesh "
+                    "node/AP on a wired backhaul. No client setting fixes this.")
+    elif dbm <= -70:
+        recs.append("📶 Weak signal. A 20 MHz channel and 2.4 GHz usually hold up "
+                    "better than 80 MHz at this range.")
+    elif dbm <= -60:
+        recs.append("📶 Moderate signal. 5 GHz is usable; expect some retries.")
     else:
-        recs.append("✅ Signal strength is good.")
+        recs.append("✅ Signal is good for this link.")
 
-    # Band
-    ch_count_current = congestion.get(adapter_info.channel, 0)
-    if ch_count_current > 3:
-        recs.append(f"📡 Channel {adapter_info.channel} is congested ({ch_count_current} networks). "
-                    f"Ask your router admin to change the channel.")
+    current = congestion.get((adapter_info.band, adapter_info.channel), 0)
+    if current > 3:
+        recs.append(f"📡 {current - 1} other BSSes share {adapter_info.band} "
+                    f"channel {adapter_info.channel}. Only the router admin can "
+                    f"change the AP channel; the client can move to another band/AP.")
 
-    # 5GHz availability
-    has_5ghz = any(n.band == "5GHz" for n in networks)
-    has_6ghz = any(n.band == "6GHz" for n in networks)
-    if has_6ghz:
-        recs.append("🚀 6GHz (WiFi 6E) networks detected — connect for maximum speed.")
-    elif has_5ghz:
-        recs.append("⚡ 5GHz networks available — preferring 5GHz for better speed.")
+    if any(n.band == "6GHz" for n in networks):
+        recs.append("🚀 6 GHz networks are visible. They only help at short range.")
+    elif any(n.band == "5GHz" for n in networks):
+        recs.append("⚡ 5 GHz is available. Prefer it only while its RSSI is "
+                    "within ~10 dB of the 2.4 GHz AP.")
 
-    # TX rate
-    if adapter_info.receive_rate_mbps > 0 and adapter_info.receive_rate_mbps < 54:
-        recs.append("⚡ Link speed is low — consider upgrading to WiFi 5 (802.11ac) or WiFi 6.")
+    if adapter_info.band == "2.4GHz" and dbm > -60:
+        recs.append("ℹ️ You are on 2.4 GHz with a strong signal; switching to 5 GHz "
+                    "would likely raise throughput.")
 
-    # Radio type
-    if adapter_info.radio_type and "802.11b" in adapter_info.radio_type:
-        recs.append("⚠️ Connected on legacy 802.11b — severely limiting speed.")
-    elif adapter_info.radio_type and "802.11g" in adapter_info.radio_type:
-        recs.append("⚠️ Connected on 802.11g — limited to 54 Mbps. Upgrade recommended.")
+    if adapter_info.receive_rate_mbps > 0:
+        recs.append(f"🔗 Negotiated link rate: {adapter_info.receive_rate_mbps:.0f} Mbps "
+                    f"rx / {adapter_info.transmit_rate_mbps:.0f} Mbps tx. This is the "
+                    f"PHY rate, not measured Internet throughput.")
 
-    if not recs:
-        recs.append("✅ WiFi connection appears well-optimized.")
+    if adapter_info.radio_type and any(k in adapter_info.radio_type for k in ("802.11b", "802.11g")):
+        recs.append("⚠️ Legacy PHY negotiated. Upgrading the adapter/AP would help more "
+                    "than any registry tweak.")
 
     return recs
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Apply
+# ─────────────────────────────────────────────────────────────────────────────
+def _ledger_labels(entries: List[dict]) -> List[str]:
+    """De-duplicate change-ledger entries into human labels."""
+    out: List[str] = []
+    seen = set()
+    for e in entries:
+        intent = e.get("intent") or e.get("property") or "setting"
+        new = e.get("new")
+        old = e.get("old")
+        if isinstance(new, (list, tuple)):
+            new = " / ".join(str(x) for x in new)
+        label = f"{intent} → {new}" if new is not None else intent
+        if old is not None and str(old) == str(new):
+            continue
+        if label in seen:
+            continue
+        seen.add(label)
+        out.append(label)
+    return out
+
+
+def _ledger_failures(entries: List[dict]) -> List[str]:
+    out, seen = [], set()
+    for e in entries:
+        intent = e.get("intent") or e.get("property") or "setting"
+        reason = e.get("reason") or "failed"
+        label = f"{intent}: {reason}"
+        if label not in seen:
+            seen.add(label)
+            out.append(label)
+    return out
 
 
 def run_optimization(profile_key: str = "balanced",
                      adapter_name: str = "Wi-Fi",
                      progress_callback=None,
-                     preview: bool = False) -> OptimizationResult:
+                     preview: bool = False,
+                     measure: bool = False,
+                     dns_primary: Optional[str] = None,
+                     dns_secondary: Optional[str] = None,
+                     apply_dns: Optional[bool] = None,
+                     apply_ecn: Optional[bool] = None) -> OptimizationResult:
     """
-    Main optimization function. Scans networks, scores them,
-    applies optimal adapter settings, and returns a full result.
+    Scan, score, and apply a profile.
 
-    When preview=True, nothing is written to the system: every proposed change
-    is recorded (real current value -> proposed value) and returned in
-    OptimizationResult.preview_changes so the user can review before applying.
+    preview=True records what *would* change and writes nothing.
+    measure=True runs the benchmark before and after (adds ~40-90 s).
+    dns_primary/dns_secondary override the profile defaults (from the Settings
+    page) so those fields are not dead controls. apply_dns/apply_ecn override the
+    profile opt-ins; both are off by default.
     """
     profile = PROFILES.get(profile_key, PROFILES["balanced"])
-    settings_applied = []
-    settings_failed = []
     preview_changes: List[dict] = []
 
-    if preview:
-        adapter_manager.set_preview_mode(True)
-    else:
-        # Defensive: ensure a real run is never silently suppressed by a
-        # preview flag left on from an interrupted preview.
-        adapter_manager.set_preview_mode(False)
+    adapter_manager.set_preview_mode(bool(preview))
+    adapter_manager.begin_run()
 
     def _progress(msg: str):
         logger.info(msg)
         if progress_callback:
             progress_callback(msg)
 
+    before_measure = None
+    measured: Optional[dict] = None
+    if measure and not preview:
+        try:
+            from core.benchmark import measure as _measure
+            _progress("⏱️ Measuring the current link (baseline)...")
+            before_measure = _measure().to_dict()
+        except Exception as e:
+            logger.warning("Baseline measurement failed: %s", e)
+            _progress(f"⚠️ Baseline measurement failed: {e}")
+
     _progress("🔍 Scanning networks...")
     networks = scan_networks()
-    _progress(f"📡 Found {len(networks)} networks.")
+    _progress(f"📡 Found {len(networks)} BSS(es).")
 
     _progress("📊 Checking current connection...")
     adapter_info = get_connected_network()
-
-    # Prefer the LIVE connected interface name for netsh commands. The name in
-    # Settings may be stale or generic ("Wi-Fi") while the real interface on
-    # this machine is e.g. "Wi-Fi 4" — using the wrong name silently fails.
-    effective_adapter = adapter_info.name if (adapter_info and adapter_info.name) else adapter_name
+    effective_adapter = (adapter_info.name if adapter_info and adapter_info.name
+                         else adapter_name)
 
     congestion = get_channel_congestion(networks)
     _progress("📈 Analyzing channel congestion...")
-
-    from core.wifi_scanner import get_saved_wifi_profiles
     saved_profiles = get_saved_wifi_profiles()
 
-    # Score all networks with corrected M-BFF and Security Gating
-    scored = [score_network(n, congestion, profile, all_networks=networks, adapter_info=adapter_info, saved_profiles=saved_profiles) for n in networks]
-    # Rank eligible networks first, then by total score
+    scored = [
+        score_network(n, congestion, profile, all_networks=networks,
+                      adapter_info=adapter_info, saved_profiles=saved_profiles)
+        for n in networks
+    ]
     scored.sort(key=lambda x: (x.is_eligible, x.total_score), reverse=True)
-
-    eligible_candidates = [s for s in scored if s.is_eligible]
-    best = eligible_candidates[0].network if eligible_candidates else None
+    eligible = [s for s in scored if s.is_eligible]
+    best = eligible[0].network if eligible else None
 
     recommendations = build_recommendations(adapter_info, networks, congestion)
 
-    # ── Safety: full independent backup of current adapter settings ──────────
-    if adapter_manager.is_admin() and not preview:
-        _progress("🛡️ Backing up current adapter settings...")
+    is_admin = adapter_manager.is_admin()
+    if not preview:
+        # Snapshot even when not elevated: DNS/TCP changes can still be applied,
+        # and Restore Defaults must be able to undo them.
+        _progress("🛡️ Backing up current adapter + system settings...")
         try:
-            adapter_manager.backup_adapter_settings()
+            adapter_manager.backup_adapter_settings(effective_adapter)
         except Exception as e:
-            logger.warning("Adapter backup failed (continuing): %s", e)
+            logger.warning("Backup failed (continuing): %s", e)
 
-    # Apply settings
     if preview:
-        _progress(f"👀 Preview mode — showing what '{profile.name}' would change...")
+        _progress(f"👀 Preview: showing what '{profile.name}' would change...")
     else:
         _progress(f"⚙️ Applying profile: {profile.name}...")
 
-    if adapter_manager.is_admin() or preview:
-        # Set preferred band
-        _progress(f"📶 Setting preferred band: {profile.preferred_band}...")
-        if adapter_manager.set_preferred_band(adapter_name, profile.preferred_band):
-            settings_applied.append(f"Preferred band → {profile.preferred_band}")
-        else:
-            settings_failed.append("Preferred band")
+    # Registry / driver settings require administrator. DNS and TCP calls are
+    # attempted either way; failures are recorded honestly.
+    if is_admin or preview:
+        _progress(f"📶 Preferred band → {profile.preferred_band}")
+        adapter_manager.set_preferred_band(effective_adapter, profile.preferred_band)
 
-        # Roaming aggressiveness
-        _progress(f"🔄 Setting roaming aggressiveness: {profile.roaming_aggressiveness}...")
-        if adapter_manager.set_roaming_aggressiveness(profile.roaming_aggressiveness):
-            settings_applied.append(f"Roaming aggressiveness → {profile.roaming_aggressiveness}/5")
-        else:
-            settings_failed.append("Roaming aggressiveness")
+        _progress(f"🔄 Roaming aggressiveness → {profile.roaming_aggressiveness}/5")
+        adapter_manager.set_roaming_aggressiveness(profile.roaming_aggressiveness)
 
-        # Transmit power
-        _progress(f"📡 Setting transmit power: {profile.transmit_power}...")
-        if adapter_manager.set_transmit_power(profile.transmit_power):
-            settings_applied.append(f"Transmit power → {profile.transmit_power}/5 (Max)")
-        else:
-            settings_failed.append("Transmit power")
+        _progress(f"📡 Transmit power → {profile.transmit_power}/5")
+        adapter_manager.set_transmit_power(profile.transmit_power)
 
-        # Power saving
-        _progress("⚡ Configuring power mode...")
-        if adapter_manager.disable_sleep_on_disconnect(profile.disable_power_save):
-            settings_applied.append("Sleep on disconnect → Disabled")
-        else:
-            settings_failed.append("Sleep on disconnect")
+        _progress("⚡ Sleep-on-disconnect / power mode...")
+        adapter_manager.disable_sleep_on_disconnect(profile.disable_power_save)
+        adapter_manager.set_power_saving(profile.disable_power_save)
 
-        if adapter_manager.set_power_saving(profile.disable_power_save):
-            settings_applied.append("WiFi power saving → Disabled (Performance mode)")
-        else:
-            settings_failed.append("Power saving mode")
+        adapter_manager.set_background_scanning(profile.background_scan)
 
-        # Background scanning
-        if adapter_manager.set_background_scanning(profile.background_scan):
-            settings_applied.append(f"Background scanning → {'Enabled' if profile.background_scan else 'Disabled'}")
+        _progress("📐 Channel width...")
+        adapter_manager.set_channel_width("2.4GHz", profile.channel_width_24)
+        adapter_manager.set_channel_width("5GHz", profile.channel_width_52)
 
-        # Selfish airtime booster & WMM priority
-        _progress("🚀 Enabling Selfish Airtime Priority & QoS Queueing...")
-        selfish_items = adapter_manager.apply_selfish_airtime_boost()
-        for item in selfish_items:
-            settings_applied.append(item)
-
-        # TCP optimization
-        if profile.optimize_tcp:
-            _progress("🌐 Optimizing TCP settings...")
-            if adapter_manager.optimize_tcp_settings(effective_adapter):
-                settings_applied.append("TCP/IP settings → Optimized (auto-tuning, RSS, ECN)")
-            else:
-                settings_failed.append("TCP optimization")
-
-        # DNS
-        if profile.set_dns:
-            _progress("🌐 Setting DNS servers...")
-            adapter_manager.flush_dns()
-            if adapter_manager.set_dns_servers(profile.dns_primary, profile.dns_secondary,
-                                               effective_adapter):
-                settings_applied.append(f"DNS → {profile.dns_primary} / {profile.dns_secondary}")
-            else:
-                settings_failed.append("DNS servers")
-
+        if profile.latency_tweaks:
+            _progress("🛠️ Optional latency tweaks (opt-in)...")
+            adapter_manager.apply_latency_tweaks(
+                connection_phy=(adapter_info.radio_type if adapter_info else None))
     else:
-        # Non-admin: apply only what we can
-        _progress("⚠️ Running without admin privileges — limited settings applied.")
-        if profile.set_dns:
-            adapter_manager.flush_dns()
-            settings_applied.append("DNS cache flushed")
+        _progress("⚠️ Not elevated: driver/registry settings need Administrator.")
+        adapter_manager.record_note("failed", adapter="system", property="driver settings",
+                              intent="Driver settings",
+                              reason="requires administrator privileges")
 
-        if profile.optimize_tcp:
-            adapter_manager.optimize_tcp_settings(effective_adapter)
-            settings_applied.append("TCP settings (partial — run as admin for full)")
+    # ECN is opt-in from Settings. When it is enabled, run the TCP pass even for
+    # a profile that normally leaves TCP alone; autotuning is usually already
+    # `normal`, so the extra write is a noop.
+    do_ecn = profile.ecn if apply_ecn is None else bool(apply_ecn)
+    if profile.optimize_tcp or do_ecn:
+        _progress("🌐 TCP stack state...")
+        adapter_manager.optimize_tcp_settings(effective_adapter, ecn=do_ecn)
 
-        settings_failed.append("Registry adapter settings (requires admin)")
+    # DNS is opt-in: it does not improve RF, and changing it can break local
+    # hostnames. `apply_dns=None` keeps the profile's flag (used by scripts).
+    do_dns = profile.set_dns if apply_dns is None else bool(apply_dns)
+    if do_dns:
+        _progress("🌐 DNS resolvers...")
+        adapter_manager.flush_dns()
+        adapter_manager.set_dns_servers(
+            dns_primary or profile.dns_primary,
+            dns_secondary or profile.dns_secondary,
+            effective_adapter)
 
-    # Estimate improvement
-    if len(settings_applied) >= 5:
-        estimated_improvement = "High — expect 15-40% improvement in throughput and stability"
-    elif len(settings_applied) >= 3:
-        estimated_improvement = "Moderate — expect 5-15% improvement"
-    else:
-        estimated_improvement = "Low — run as Administrator for full optimization"
+    ledger = adapter_manager.get_run_changes()
 
+    restart_message = ""
+    # Only NDIS/registry changes require a miniport reload. DNS / power-plan /
+    # TCP changes take effect immediately and should not drop the link.
+    driver_changes = [e for e in ledger["changed"]
+                      if e.get("subkey") not in (None, "", "-", "system")]
     if preview:
         preview_changes = adapter_manager.get_preview_changes()
         adapter_manager.set_preview_mode(False)
-        _progress(f"✅ Preview complete — {len(preview_changes)} change(s) would be made.")
     else:
-        _progress("✅ Optimization complete!")
+        if profile.restart_adapter and driver_changes:
+            _progress("🔁 Reloading the Wi-Fi adapter so the new values take effect...")
+            ok, restart_message = adapter_manager.restart_adapter(effective_adapter)
+            if not ok:
+                restart_message += (" Until the adapter is reloaded (or the PC "
+                                    "reboots), NDIS registry values may not apply.")
+            _progress(("✅ " if ok else "⚠️ ") + restart_message)
+        elif not ledger["changed"]:
+            if ledger["failed"]:
+                restart_message = ("No changes were applied — driver settings require "
+                                   "Administrator. Relaunch the app elevated.")
+            else:
+                restart_message = "No changes were needed; adapter reload skipped."
+        elif not driver_changes:
+            restart_message = ("Only system settings (DNS / power / TCP) changed; "
+                               "they apply immediately, so the adapter was not reloaded.")
+        else:
+            restart_message = "Adapter reload skipped by profile."
+
+        if measure:
+            try:
+                from core.benchmark import measure as _measure
+                _progress("⏱️ Measuring the link after the change (settling 5 s)...")
+                import time as _time
+                _time.sleep(5)
+                after = _measure().to_dict()
+                measured = {"before": before_measure, "after": after}
+            except Exception as e:
+                logger.warning("Post-change measurement failed: %s", e)
+                measured = {"before": before_measure, "after": None, "error": str(e)}
+        else:
+            measured = None
+
+    settings_applied = _ledger_labels(ledger["changed"])
+    settings_unchanged = _ledger_labels(ledger["noop"])
+    settings_failed = _ledger_failures(ledger["failed"])
+    settings_skipped = _ledger_failures(ledger["skipped"])
+
+    if preview:
+        estimated = "Not measured (preview) — no changes were written."
+    elif measured and measured.get("before") and measured.get("after"):
+        b, a = measured["before"], measured["after"]
+        estimated = (f"Measured: {b.get('throughput_mbps', 0):.1f} → "
+                     f"{a.get('throughput_mbps', 0):.1f} Mbps, "
+                     f"latency p95 {b.get('latency_p95_ms', 0):.0f} → "
+                     f"{a.get('latency_p95_ms', 0):.0f} ms.")
+    else:
+        estimated = ("Not measured. Use Measure before/after (or the benchmark "
+                     "script) to compare real throughput and latency.")
+
+    if preview:
+        _progress(f"✅ Preview complete — {len(preview_changes)} proposed change(s).")
+    else:
+        _progress(f"✅ Done — {len(settings_applied)} changed, "
+                  f"{len(settings_unchanged)} already at target, "
+                  f"{len(settings_failed)} failed, {len(settings_skipped)} unsupported.")
 
     return OptimizationResult(
         profile_name=profile.name,
@@ -555,9 +621,13 @@ def run_optimization(profile_key: str = "balanced",
         network_scores=scored,
         settings_applied=settings_applied,
         settings_failed=settings_failed,
-        estimated_improvement=estimated_improvement,
+        estimated_improvement=estimated,
         adapter_info=adapter_info,
         channel_congestion=congestion,
         recommendations=recommendations,
         preview_changes=preview_changes,
+        settings_unchanged=settings_unchanged,
+        settings_skipped=settings_skipped,
+        restart_message=restart_message,
+        measured=measured,
     )

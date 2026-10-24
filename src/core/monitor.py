@@ -37,6 +37,8 @@ class MonitorSnapshot:
     channel: int
     quality: str  # Excellent / Good / Fair / Poor / Very Poor
     governor_state: str = GovernorState.HEALTHY
+    band: str = ""
+    efficiency: Optional[float] = None  # sampled goodput / min(rx, tx) PHY rate
 
     def to_dict(self) -> dict:
         return {
@@ -50,6 +52,8 @@ class MonitorSnapshot:
             "throughput_up_mbps": round(self.throughput_up_mbps, 2),
             "ssid": self.ssid,
             "channel": self.channel,
+            "band": self.band,
+            "efficiency": round(self.efficiency, 3) if self.efficiency is not None else None,
             "quality": self.quality,
             "governor_state": self.governor_state,
         }
@@ -91,6 +95,7 @@ class WiFiMonitor:
         self._prev_bytes_sent = 0
         self._prev_bytes_recv = 0
         self._prev_time = 0.0
+        self._prev_nic = ""
         self._running = False
 
         # Link Governor state machine
@@ -234,15 +239,31 @@ class WiFiMonitor:
         adapter = get_connected_network()
         now = time.time()
 
-        # Network throughput
+        # Network throughput (per-interface when possible)
         try:
-            counters = psutil.net_io_counters()
+            nic = adapter.name if adapter else ""
+            per_nic = psutil.net_io_counters(pernic=True)
+            if nic and nic in per_nic:
+                counters = per_nic[nic]
+            else:
+                counters = psutil.net_io_counters()
+                nic = ""
+
             dt = now - self._prev_time if self._prev_time else 1.0
             if dt <= 0:
                 dt = 1.0
 
-            bytes_sent_delta = counters.bytes_sent - self._prev_bytes_sent
-            bytes_recv_delta = counters.bytes_recv - self._prev_bytes_recv
+            # Reset the baseline when the active adapter changes; otherwise the
+            # first sample subtracts unrelated counters and reports a spike.
+            if nic != self._prev_nic:
+                self._prev_nic = nic
+                self._prev_bytes_sent = counters.bytes_sent
+                self._prev_bytes_recv = counters.bytes_recv
+                bytes_sent_delta = 0
+                bytes_recv_delta = 0
+            else:
+                bytes_sent_delta = max(0, counters.bytes_sent - self._prev_bytes_sent)
+                bytes_recv_delta = max(0, counters.bytes_recv - self._prev_bytes_recv)
 
             throughput_down = (bytes_recv_delta / dt) / 1_000_000 * 8  # Mbps
             throughput_up = (bytes_sent_delta / dt) / 1_000_000 * 8    # Mbps
@@ -257,6 +278,13 @@ class WiFiMonitor:
 
         signal_pct = adapter.signal_percent if adapter else 0
         signal_dbm = adapter.signal_dbm if adapter else -100.0
+        phy_floor = min(v for v in (
+            adapter.receive_rate_mbps if adapter else 0.0,
+            adapter.transmit_rate_mbps if adapter else 0.0) if v > 0) \
+            if adapter and (adapter.receive_rate_mbps > 0 or adapter.transmit_rate_mbps > 0) else 0.0
+        efficiency = None
+        if phy_floor > 0:
+            efficiency = max(0.0, min(2.0, throughput_down / phy_floor))
 
         # Update Link Governor
         alert = self.update_governor(signal_dbm, now)
@@ -282,5 +310,7 @@ class WiFiMonitor:
             channel=adapter.channel if adapter else 0,
             quality=signal_to_quality(signal_pct),
             governor_state=self.governor_state,
+            band=adapter.band if adapter else "",
+            efficiency=efficiency,
         )
         return snap

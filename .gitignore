@@ -4,6 +4,12 @@ __pycache__/
 *.log
 adapter_rollback_snapshot.json
 adapter_settings_backup.json
+adapter_settings_backup_*.json
+system_rollback_snapshot.json
+benchmarks.jsonl
+verify_before.json
+verify_after.json
+app_bin_new/
 dist/
 build/
 .pytest_cache/

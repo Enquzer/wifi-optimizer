@@ -65,12 +65,12 @@ def notify_optimization_start(profile_name: str):
     )
 
 
-def notify_optimization_complete(settings_count: int, improvement: str):
-    notify(
-        "✅ WiFi Optimized!",
-        f"{settings_count} settings applied. Estimated improvement: {improvement}",
-        duration="long"
-    )
+def notify_optimization_complete(settings_count: int, detail: str = ""):
+    msg = f"{settings_count} setting(s) changed on this PC."
+    if detail:
+        msg += f" {detail}"
+    msg += " RF signal is physical; check the dashboard for before → after values."
+    notify("✅ Optimization finished", msg, duration="long")
 
 
 def notify_signal_weak(signal_percent: int):

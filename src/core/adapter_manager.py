@@ -12,8 +12,14 @@ import os
 import json
 import time
 import re
+from datetime import datetime
 from typing import Optional, Dict, Any, List, Tuple
 from dataclasses import dataclass, asdict
+
+try:
+    from core import wlan_native
+except ImportError:  # direct import when src/core is on sys.path
+    import wlan_native
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +27,11 @@ logger = logging.getLogger(__name__)
 NETWORK_ADAPTERS_KEY = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e972-e325-11ce-bfc1-08002be10318}"
 SNAPSHOT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "adapter_rollback_snapshot.json")
 BACKUP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "adapter_settings_backup.json")
+SYSTEM_SNAPSHOT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "system_rollback_snapshot.json")
+
+# powercfg GUIDs for "Wireless Adapter Settings > Power Saving Mode"
+WIRELESS_SUBGROUP = "19cbb8fa-5279-450e-9fac-8a3d5fedd0c1"
+WIRELESS_SETTING = "12bbebe6-58d6-4636-95bb-3217ef867c1a"
 
 # Common WiFi adapter property IDs (standard NDIS 6.x keywords)
 PROP_ROAMING_AGGRESSIVENESS = "*RoamAggressiveness"
@@ -43,6 +54,39 @@ _SESSION_SNAPSHOTS: List[Dict[str, Any]] = []
 # can see exactly what WOULD change before anything is written.
 _PREVIEW_MODE: bool = False
 _PREVIEW_CHANGES: List[Dict[str, Any]] = []
+
+# Per-run change ledger. Only entries in "changed" are real, applied changes;
+# "noop" means the adapter was already at the target value. The UI/optimizer
+# reports these separately instead of inflating the applied count.
+_RUN: Dict[str, List[Dict[str, Any]]] = {
+    "changed": [], "noop": [], "failed": [], "skipped": [],
+}
+
+
+def begin_run():
+    """Reset the change ledger before an optimization/preview pass."""
+    for bucket in _RUN.values():
+        bucket.clear()
+
+
+def _note(kind: str, **info):
+    bucket = _RUN.get(kind)
+    if bucket is not None:
+        bucket.append(info)
+
+
+def record_note(kind: str, **info):
+    """Public wrapper around the change ledger (used outside this module).
+
+    `kind` is one of changed / noop / failed / skipped. Unknown kinds are
+    ignored, so a caller cannot corrupt the ledger.
+    """
+    _note(kind, **info)
+
+
+def get_run_changes() -> Dict[str, List[Dict[str, Any]]]:
+    """Return a copy of the current change ledger."""
+    return {k: list(v) for k, v in _RUN.items()}
 
 
 def set_dry_run_mode(enabled: bool):
@@ -100,9 +144,15 @@ def _read_current_value(subkey_name: str, prop_name: str) -> Tuple[bool, Optiona
 
 
 def _record_preview(subkey_name: str, prop_name: str, value: str, desc: str,
-                    intent: Optional[str] = None):
-    """Record a single proposed change (real current value -> proposed value)."""
+                    intent: Optional[str] = None,
+                    compare_value: Optional[str] = None):
+    """Record a single proposed change (real current value -> proposed value).
+
+    `value` is what the user should see (e.g. "2.4GHz"/"20MHz"), while
+    `compare_value` is the driver code actually compared with the registry.
+    """
     existed, current = _read_current_value(subkey_name, prop_name)
+    effective = str(value) if compare_value is None else str(compare_value)
     _PREVIEW_CHANGES.append({
         "subkey": subkey_name,
         "adapter": desc,
@@ -110,7 +160,7 @@ def _record_preview(subkey_name: str, prop_name: str, value: str, desc: str,
         "intent": intent or "",
         "current": current if existed else None,
         "proposed": str(value),
-        "changed": (current != str(value)),
+        "changed": (current != effective),
     })
     logger.info("[PREVIEW] %s (%s): %s  %s -> %s", desc, subkey_name, prop_name,
                 current if existed else "(not set)", value)
@@ -146,6 +196,29 @@ def run_netsh(args: list, check: bool = False) -> Tuple[bool, str]:
     except Exception as e:
         logger.error("netsh error: %s", e)
         return False, str(e)
+
+
+def run_powershell(script: str, timeout: int = 15) -> Tuple[bool, str]:
+    """Run a PowerShell snippet and return (success, stdout).
+
+    Callers that mutate system state must guard with `_suppress_mutations()`
+    themselves; this helper is also used for read-only queries in preview mode.
+    """
+    try:
+        res = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True, text=True, timeout=timeout,
+            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0,
+        )
+        return res.returncode == 0, (res.stdout or "").strip()
+    except Exception as e:
+        logger.debug("PowerShell failed: %s", e)
+        return False, ""
+
+
+def _ps_quote(value: str) -> str:
+    """Quote a value for a single-quoted PowerShell string literal."""
+    return "'" + str(value).replace("'", "''") + "'"
 
 
 def find_active_wifi_adapters(target_guid: Optional[str] = None) -> List[Dict[str, str]]:
@@ -193,6 +266,19 @@ def find_active_wifi_adapters(target_guid: Optional[str] = None) -> List[Dict[st
                     break
     except Exception as e:
         logger.error("Error enumerating network adapters: %s", e)
+
+    # Drop stale registry duplicates: keep only keys whose GUID is a WLAN
+    # interface currently enumerated by the OS. This avoids writing to ghost
+    # subkeys left behind by old drivers or renamed adapters.
+    try:
+        present = {i["guid"].strip("{}").lower() for i in wlan_native.list_interfaces()}
+        if present:
+            filtered = [a for a in adapters
+                        if not a["guid"] or a["guid"].strip("{}").lower() in present]
+            if filtered:
+                adapters = filtered
+    except Exception:
+        pass
 
     # Merge any mock-only adapters during dry-run
     if _DRY_RUN:
@@ -437,7 +523,9 @@ BAND_SYNONYMS = {
 }
 POWER_SAVE_SYNONYMS = {
     "disable": ["no smps", "disabled", "off"],
-    "enable":  ["auto smps", "enabled"],
+    # "enable" means "prefer power saving": Intel exposes Static/Dynamic SMPS.
+    "enable":  ["auto smps", "static smps", "dynamic smps", "enabled",
+                "maximum power saving", "medium power saving"],
 }
 ON_OFF_SYNONYMS = {
     "on":  ["enabled"],
@@ -580,17 +668,34 @@ def resolve_intent_code(intent: str, semantic: str,
 
 def _write_adapter_value(subkey_name: str, prop_name: str, value: str, desc: str,
                          verify_ndi_support: bool = True,
-                         intent: Optional[str] = None) -> bool:
-    """Write a validated registry value on one adapter subkey, recording a snapshot."""
+                         intent: Optional[str] = None,
+                         display_value: Optional[str] = None) -> bool:
+    """Write a validated registry value on one adapter subkey, recording a snapshot.
+
+    Returns True when the adapter is (now) at the requested value, False when
+    the write failed or is unsupported. The run ledger distinguishes a real
+    change from a no-op so callers never report "applied" for an unchanged value.
+    """
+    label = intent or prop_name
+    # `shown` is the human-facing value (e.g. "2.4GHz"/"20MHz") while `value`
+    # is the driver's numeric code. Reporting the code alone looked like a bug.
+    shown = display_value if display_value is not None else str(value)
     if verify_ndi_support:
         supported = discover_supported_adapter_params(subkey_name)
         if supported and prop_name not in supported:
             logger.info("Property %s not supported on %s (%s). Skipping.",
                         prop_name, subkey_name, desc)
+            _note("skipped", adapter=desc, subkey=subkey_name, property=prop_name,
+                  intent=label, reason="driver does not expose this setting")
             return False
 
     if _PREVIEW_MODE:
-        _record_preview(subkey_name, prop_name, str(value), desc, intent=intent)
+        existed, current = _read_current_value(subkey_name, prop_name)
+        _record_preview(subkey_name, prop_name, shown, desc, intent=label,
+                        compare_value=str(value))
+        _note("changed" if (not existed or current != str(value)) else "noop",
+              adapter=desc, subkey=subkey_name, property=prop_name, intent=label,
+              old=current if existed else None, new=shown)
         return True
 
     if _DRY_RUN:
@@ -599,6 +704,9 @@ def _write_adapter_value(subkey_name: str, prop_name: str, value: str, desc: str
         orig = mock.get(prop_name)
         _record_snapshot_entry(subkey_name, prop_name, orig, existed, str(value))
         mock[prop_name] = str(value)
+        _note("changed" if (not existed or orig != str(value)) else "noop",
+              adapter=desc, subkey=subkey_name, property=prop_name, intent=label,
+              old=orig, new=shown)
         logger.info("[DRY-RUN] Set %s=%s on %s (%s)", prop_name, value, subkey_name, desc)
         return True
 
@@ -613,15 +721,39 @@ def _write_adapter_value(subkey_name: str, prop_name: str, value: str, desc: str
                 existed = True
             except FileNotFoundError:
                 existed = False
+
+            # Already at the requested value: do not write, do not snapshot.
+            if existed and str(orig_val) == str(value):
+                logger.info("%s=%s already set on %s (%s). No change.",
+                            prop_name, value, subkey_name, desc)
+                _note("noop", adapter=desc, subkey=subkey_name, property=prop_name,
+                      intent=label, old=orig_val, new=shown)
+                return True
+
             winreg.SetValueEx(key, prop_name, 0, winreg.REG_SZ, str(value))
             _record_snapshot_entry(subkey_name, prop_name, orig_val, existed, str(value))
+            # A registry write can be accepted and then rejected/normalized by the
+            # driver. Read it back so "changed" means the value is actually there.
+            read_back = winreg.QueryValueEx(key, prop_name)[0]
+            if str(read_back) != str(value):
+                logger.warning("Read-back mismatch for %s on %s: wrote %r, got %r",
+                               prop_name, subkey_name, value, read_back)
+                _note("failed", adapter=desc, subkey=subkey_name, property=prop_name,
+                      intent=label, reason=f"read-back mismatch ({read_back!r})")
+                return False
+            _note("changed", adapter=desc, subkey=subkey_name, property=prop_name,
+                  intent=label, old=orig_val, new=shown)
             logger.info("Set %s=%s on %s (%s) (miniport will reinitialize)",
                         prop_name, value, subkey_name, desc)
             return True
     except PermissionError:
         logger.warning("Access denied setting %s on %s. Run as Administrator.", prop_name, desc)
+        _note("failed", adapter=desc, subkey=subkey_name, property=prop_name,
+              intent=label, reason="access denied (run as administrator)")
     except Exception as e:
         logger.error("Error setting %s on %s: %s", prop_name, desc, e)
+        _note("failed", adapter=desc, subkey=subkey_name, property=prop_name,
+              intent=label, reason=str(e))
     return False
 
 
@@ -634,6 +766,8 @@ def apply_intent(intent: str, semantic: str,
     adapters = find_active_wifi_adapters(target_guid)
     if not adapters:
         logger.warning("No active WiFi adapter located for intent '%s'", intent)
+        _note("skipped", adapter="-", property=intent, intent=INTENT_LABELS.get(intent, intent),
+              reason="no active Wi-Fi adapter")
         return False
 
     success = False
@@ -644,13 +778,19 @@ def apply_intent(intent: str, semantic: str,
             continue
         keyword = _match_intent_keyword(intent, params)
         if not keyword:
+            _note("skipped", adapter=ad["desc"], subkey=subkey, property=intent,
+                  intent=INTENT_LABELS.get(intent, intent),
+                  reason="driver does not expose this setting")
             continue
         ok, code, reason = resolve_intent_code(intent, semantic, params[keyword])
         if not ok:
             logger.warning("Intent %s=%s unresolvable on %s: %s", intent, semantic, subkey, reason)
+            _note("skipped", adapter=ad["desc"], subkey=subkey, property=keyword,
+                  intent=INTENT_LABELS.get(intent, intent), reason=reason)
             continue
         if _write_adapter_value(subkey, keyword, code, ad["desc"], verify_ndi_support=False,
-                                intent=INTENT_LABELS.get(intent, intent)):
+                                intent=INTENT_LABELS.get(intent, intent),
+                                display_value=semantic):
             logger.info("Intent %s=%s -> %s=%s on %s (%s)",
                         intent, semantic, keyword, code, ad["desc"], reason)
             success = True
@@ -689,6 +829,17 @@ def discover_optimizer_capabilities(target_guid: Optional[str] = None) -> List[D
 
 def _record_snapshot_entry(subkey_name: str, prop_name: str, original_val: Optional[str], existed: bool, new_val: str):
     """Record a setting change in the in-memory rollback list and disk snapshot."""
+    # Preserve history across app restarts. Without this, the first write of a
+    # new session overwrote the on-disk log and Restore Defaults could only undo
+    # the newest session. Stale adapter subkeys are filtered at restore time.
+    if not _SESSION_SNAPSHOTS and os.path.exists(SNAPSHOT_FILE):
+        try:
+            with open(SNAPSHOT_FILE, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, list):
+                _SESSION_SNAPSHOTS.extend(e for e in loaded if isinstance(e, dict))
+        except Exception as e:
+            logger.debug("Could not load existing rollback snapshot: %s", e)
     entry = {
         "subkey": subkey_name,
         "property": prop_name,
@@ -712,13 +863,183 @@ def _save_snapshot_to_disk():
         logger.warning("Could not persist rollback snapshot: %s", e)
 
 
-def backup_adapter_settings() -> Optional[str]:
+def _current_subkeys_or_none() -> Optional[set]:
+    """Subkeys of WLAN adapters that currently exist, or None if unknown.
+
+    Registry-class keys left behind by an old/renamed driver (the app used to
+    write 0002/0014/0017 as well as the live 0021) must never be restored or
+    reported as current changes.
+    """
+    try:
+        adapters = find_active_wifi_adapters()
+        if adapters:
+            return {a["subkey"] for a in adapters if a.get("subkey")}
+    except Exception:
+        pass
+    return None
+
+
+def _backup_files() -> List[str]:
+    """Timestamped backups only.
+
+    The legacy fixed-name `adapter_settings_backup.json` was overwritten on
+    every run and already contained post-optimization values, so it is not a
+    safe restore source and is deliberately excluded.
+    """
+    folder = os.path.dirname(BACKUP_FILE)
+    legacy = os.path.basename(BACKUP_FILE)
+    try:
+        return [os.path.join(folder, f) for f in os.listdir(folder)
+                if f.startswith("adapter_settings_backup_") and f.endswith(".json")
+                and f != legacy]
+    except Exception:
+        return []
+
+
+def _latest_backup_file() -> Optional[str]:
+    """Newest timestamped adapter_settings_backup_*.json, if any."""
+    files = _backup_files()
+    return max(files, key=os.path.getmtime) if files else None
+
+
+def _prune_backups(keep: int = 5):
+    try:
+        files = _backup_files()
+        for path in sorted(files, key=os.path.getmtime, reverse=True)[keep:]:
+            os.remove(path)
+    except Exception:
+        pass
+
+
+def snapshot_system_settings(adapter_name: Optional[str] = None) -> Optional[str]:
+    """
+    Record every non-registry change the optimizer can make (DNS, wireless power
+    plan index, TCP autotuning/ECN) so "Restore Defaults" can actually undo it.
+    """
+    if _suppress_mutations():
+        return None
+    name = adapter_name or detect_wifi_interface_name() or "Wi-Fi"
+    # Keep the first pre-change snapshot. Overwriting it on a second optimize
+    # would capture already-optimized values and break Restore Defaults.
+    if os.path.exists(SYSTEM_SNAPSHOT_FILE):
+        logger.info("Keeping existing pre-change system snapshot: %s",
+                    SYSTEM_SNAPSHOT_FILE)
+        return SYSTEM_SNAPSHOT_FILE
+    data = {
+        "created": time.time(),
+        "adapter": name,
+        "dns_v4": get_current_dns(name),
+        "power_scheme": _active_power_scheme(),
+        "wireless_power": _query_wireless_power(),
+        "tcp": get_tcp_state(),
+    }
+    try:
+        with open(SYSTEM_SNAPSHOT_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        logger.info("System settings snapshot written to %s", SYSTEM_SNAPSHOT_FILE)
+        return SYSTEM_SNAPSHOT_FILE
+    except Exception as e:
+        logger.warning("Could not write system snapshot: %s", e)
+        return None
+
+
+def restore_system_settings(snapshot_path: Optional[str] = None) -> List[str]:
+    """Undo DNS / wireless power plan / TCP changes captured by the snapshot."""
+    path = snapshot_path or SYSTEM_SNAPSHOT_FILE
+    log: List[str] = []
+    if not os.path.exists(path):
+        return ["No system snapshot to restore."]
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        return [f"Could not read system snapshot: {e}"]
+
+    if _suppress_mutations():
+        return ["[simulated] System settings restore"]
+
+    name = data.get("adapter") or detect_wifi_interface_name() or "Wi-Fi"
+
+    # DNS
+    dns = data.get("dns_v4")
+    if dns is not None:
+        try:
+            if not dns:
+                ok, _ = run_netsh(["interface", "ipv4", "set", "dnsservers",
+                                   f"name={name}", "dhcp"])
+                log.append(f"DNS -> DHCP ({name}): {'ok' if ok else 'failed'}")
+            else:
+                ok, _ = run_netsh(["interface", "ipv4", "set", "dnsservers",
+                                   f"name={name}", "static", dns[0], "primary"])
+                for i, server in enumerate(dns[1:], start=2):
+                    ok2, _ = run_netsh(["interface", "ipv4", "add", "dnsservers",
+                                        f"name={name}", server, f"index={i}"])
+                    ok = ok and ok2
+                log.append(f"DNS -> {', '.join(dns)}: {'ok' if ok else 'failed'}")
+            flush_dns()
+        except Exception as e:
+            log.append(f"DNS restore failed: {e}")
+
+    # Wireless power plan
+    scheme = data.get("power_scheme")
+    wp = data.get("wireless_power") or {}
+    if scheme and ("ac" in wp or "dc" in wp):
+        try:
+            rcs = []
+            if "ac" in wp:
+                rcs.append(subprocess.run(
+                    ["powercfg", "/setacvalueindex", scheme, WIRELESS_SUBGROUP,
+                     WIRELESS_SETTING, str(wp["ac"])],
+                    capture_output=True, timeout=10).returncode)
+            if "dc" in wp:
+                rcs.append(subprocess.run(
+                    ["powercfg", "/setdcvalueindex", scheme, WIRELESS_SUBGROUP,
+                     WIRELESS_SETTING, str(wp["dc"])],
+                    capture_output=True, timeout=10).returncode)
+            rcs.append(subprocess.run(
+                ["powercfg", "/setactive", scheme],
+                capture_output=True, timeout=10).returncode)
+            if any(rc != 0 for rc in rcs):
+                log.append(f"Power plan restore failed (powercfg rc={rcs})")
+            else:
+                log.append(f"Wireless power plan restored (AC={wp.get('ac')}, DC={wp.get('dc')})")
+        except Exception as e:
+            log.append(f"Power plan restore failed: {e}")
+
+    # TCP
+    tcp = data.get("tcp") or {}
+    try:
+        if "AutoTuningLevelLocal" in tcp:
+            level = _TCP_AUTOTUNING.get(int(tcp["AutoTuningLevelLocal"]))
+            if level:
+                ok, _ = run_netsh(["interface", "tcp", "set", "global",
+                                   f"autotuninglevel={level}"])
+                log.append(f"TCP autotuning -> {level}: {'ok' if ok else 'failed'}")
+        if "EcnCapability" in tcp:
+            mode = "enabled" if int(tcp["EcnCapability"]) == 1 else "disabled"
+            ok, _ = run_netsh(["interface", "tcp", "set", "global",
+                               f"ecncapability={mode}"])
+            log.append(f"TCP ECN -> {mode}: {'ok' if ok else 'failed'}")
+        if "Timestamps" in tcp:
+            mode = "enabled" if int(tcp["Timestamps"]) == 1 else "disabled"
+            ok, _ = run_netsh(["interface", "tcp", "set", "global",
+                               f"timestamps={mode}"])
+            log.append(f"TCP timestamps -> {mode}: {'ok' if ok else 'failed'}")
+    except Exception as e:
+        log.append(f"TCP restore failed: {e}")
+
+    return log
+
+
+def backup_adapter_settings(adapter_name: Optional[str] = None) -> Optional[str]:
     """
     Safety net: export the CURRENT value of every advanced property for every
-    active WiFi adapter to a timestamped-agnostic JSON file BEFORE any change.
-    Read-only against the registry. This is a full, independent backup you can
-    inspect or restore from even if the per-change snapshot is lost.
-    Returns the backup path (or None on dry-run).
+    active WiFi adapter to a *timestamped* JSON file BEFORE any change, plus a
+    non-registry system snapshot (DNS / power plan / TCP).
+
+    The old implementation overwrote one fixed file, so a second "optimize"
+    replaced the pre-optimization backup with already-optimized values. Fixing
+    that makes Restore Defaults trustworthy.
     """
     backup = {"created": time.time(), "adapters": {}}
     for ad in find_active_wifi_adapters():
@@ -743,15 +1064,22 @@ def backup_adapter_settings() -> Optional[str]:
     if _PREVIEW_MODE:
         logger.info("[PREVIEW] Adapter settings backup skipped (read-only)")
         return None
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(os.path.dirname(BACKUP_FILE),
+                        f"adapter_settings_backup_{stamp}.json")
     try:
-        with open(BACKUP_FILE, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(backup, f, indent=2)
+        _prune_backups(keep=5)
         logger.info("Adapter settings backup written to %s (%d adapters)",
-                    BACKUP_FILE, len(backup["adapters"]))
-        return BACKUP_FILE
+                    path, len(backup["adapters"]))
     except Exception as e:
         logger.warning("Could not write adapter settings backup: %s", e)
         return None
+
+    snapshot_system_settings(adapter_name)
+    return path
 
 
 def restore_from_backup(backup_path: Optional[str] = None) -> Tuple[bool, List[str]]:
@@ -759,9 +1087,12 @@ def restore_from_backup(backup_path: Optional[str] = None) -> Tuple[bool, List[s
     Restore adapter advanced properties from a full backup file created by
     backup_adapter_settings(). Independent of the per-change snapshot.
     """
-    path = backup_path or BACKUP_FILE
-    if not os.path.exists(path):
-        return False, [f"No backup file found at {path}"]
+    path = backup_path or _latest_backup_file()
+    if not path or not os.path.exists(path):
+        return False, [
+            "No timestamped adapter backup found. Use Restore Defaults (which "
+            "replays the per-change snapshot) or create a new backup first."
+        ]
     try:
         with open(path, "r", encoding="utf-8") as f:
             backup = json.load(f)
@@ -769,10 +1100,16 @@ def restore_from_backup(backup_path: Optional[str] = None) -> Tuple[bool, List[s
         return False, [f"Could not read backup: {e}"]
 
     log: List[str] = []
+    had_error = False
+    active_subkeys = _current_subkeys_or_none()
     for subkey, info in backup.get("adapters", {}).items():
+        if active_subkeys is not None and subkey not in active_subkeys:
+            log.append(f"Skipped stale adapter subkey {subkey} (not present)")
+            continue
         for prop, value in (info.get("values") or {}).items():
-            if _DRY_RUN:
-                log.append(f"[DRY-RUN] Restore {prop}={value} on {subkey}")
+            if _suppress_mutations():
+                label = "PREVIEW" if _PREVIEW_MODE else "DRY-RUN"
+                log.append(f"[{label}] Restore {prop}={value} on {subkey}")
                 continue
             try:
                 adapter_path = f"{NETWORK_ADAPTERS_KEY}\\{subkey}"
@@ -781,14 +1118,18 @@ def restore_from_backup(backup_path: Optional[str] = None) -> Tuple[bool, List[s
                     winreg.SetValueEx(key, prop, 0, winreg.REG_SZ, str(value))
                     log.append(f"Restored {prop}={value} on {subkey}")
             except Exception as e:
+                had_error = True
                 log.append(f"Failed to restore {prop} on {subkey}: {e}")
-    return True, log
+    return (not had_error), log
 
 
 def rollback_settings(snapshot_path: Optional[str] = None) -> Tuple[bool, List[str]]:
     """
     Atomic rollback of all applied adapter modifications.
     Restores original registry values and deletes injected keys.
+
+    Returns (ok, log). `ok` is False if any registry write failed; in that case
+    the snapshot is kept so the user can retry after fixing permissions.
     """
     path = snapshot_path or SNAPSHOT_FILE
     snapshots_to_restore = list(_SESSION_SNAPSHOTS)
@@ -801,10 +1142,25 @@ def rollback_settings(snapshot_path: Optional[str] = None) -> Tuple[bool, List[s
             logger.error("Failed to read snapshot file for rollback: %s", e)
             return False, [f"Error reading snapshot: {e}"]
 
+    # No registry changes, but the optimizer may still have changed DNS, the
+    # wireless power plan, or TCP. Restore those too instead of returning early.
     if not snapshots_to_restore:
-        return True, ["No previous settings to roll back."]
+        if _suppress_mutations():
+            return True, ["[simulated] No registry changes to roll back."]
+        sys_log = restore_system_settings()
+        if not sys_log or sys_log == ["No system snapshot to restore."]:
+            return True, ["No previous settings to roll back."]
+        sys_ok = not any("failed" in s.lower() for s in sys_log)
+        if sys_ok:
+            try:
+                os.remove(SYSTEM_SNAPSHOT_FILE)
+            except Exception:
+                pass
+        return sys_ok, sys_log
 
-    restored_log = []
+    restored_log: List[str] = []
+    had_error = False
+    active_subkeys = _current_subkeys_or_none()
     # Process in reverse order of application
     for entry in reversed(snapshots_to_restore):
         subkey_name = entry["subkey"]
@@ -812,10 +1168,15 @@ def rollback_settings(snapshot_path: Optional[str] = None) -> Tuple[bool, List[s
         orig = entry.get("original_value")
         existed = entry.get("existed", False)
 
-        if _DRY_RUN:
+        if active_subkeys is not None and subkey_name not in active_subkeys:
+            restored_log.append(f"Skipped stale adapter subkey {subkey_name} ({prop})")
+            continue
+
+        if _suppress_mutations():
+            label = "PREVIEW" if _PREVIEW_MODE else "DRY-RUN"
             action = f"Restored {prop} -> {orig}" if existed else f"Deleted injected {prop}"
-            restored_log.append(f"[DRY-RUN] {subkey_name}: {action}")
-            if subkey_name in _MOCK_REGISTRY:
+            restored_log.append(f"[{label}] {subkey_name}: {action}")
+            if _DRY_RUN and subkey_name in _MOCK_REGISTRY:
                 if existed:
                     _MOCK_REGISTRY[subkey_name][prop] = orig
                 else:
@@ -835,18 +1196,39 @@ def rollback_settings(snapshot_path: Optional[str] = None) -> Tuple[bool, List[s
                     except FileNotFoundError:
                         pass
         except Exception as e:
+            had_error = True
             logger.error("Error rolling back %s on %s: %s", prop, subkey_name, e)
             restored_log.append(f"Failed to roll back {prop}: {e}")
 
-    # Clear snapshot after successful rollback
-    _SESSION_SNAPSHOTS.clear()
-    if not _DRY_RUN and os.path.exists(path):
-        try:
-            os.remove(path)
-        except Exception:
-            pass
+    # Clear the snapshot only if every registry write succeeded. Otherwise keep
+    # it so Restore Defaults can be retried (for example after elevation).
+    if not had_error:
+        _SESSION_SNAPSHOTS.clear()
+        if not _suppress_mutations() and os.path.exists(path):
+            try:
+                os.remove(path)
+            except Exception:
+                pass
 
-    return True, restored_log
+    # The old "Restore Defaults" only replayed the adapter registry snapshot and
+    # left DNS / power-plan / TCP changes behind. Undo them too, then reload the
+    # adapter so the restored registry values actually take effect.
+    system_ok = True
+    if not _suppress_mutations():
+        sys_log = restore_system_settings()
+        restored_log.extend(sys_log)
+        system_ok = not any("failed" in s.lower() for s in sys_log)
+        if system_ok:
+            try:
+                os.remove(SYSTEM_SNAPSHOT_FILE)
+            except Exception:
+                pass
+        if not had_error:
+            name = detect_wifi_interface_name()
+            ok, msg = restart_adapter(name, wait_seconds=20)
+            restored_log.append(msg)
+
+    return (not had_error and system_ok), restored_log
 
 
 def _set_adapter_registry_value_safe(prop_name: str, value: str,
@@ -885,7 +1267,11 @@ def _set_adapter_registry_value_safe(prop_name: str, value: str,
 
         # Preview branch: report real current -> proposed without writing
         if _PREVIEW_MODE:
+            existed, current = _read_current_value(subkey_name, prop_name)
             _record_preview(subkey_name, prop_name, effective_value, ad["desc"])
+            _note("changed" if (not existed or current != str(effective_value)) else "noop",
+                  adapter=ad["desc"], subkey=subkey_name, property=prop_name,
+                  intent=prop_name, old=current if existed else None, new=effective_value)
             success = True
             continue
 
@@ -896,6 +1282,9 @@ def _set_adapter_registry_value_safe(prop_name: str, value: str,
             orig_val = mock_adapter.get(prop_name)
             _record_snapshot_entry(subkey_name, prop_name, orig_val, existed, effective_value)
             mock_adapter[prop_name] = effective_value
+            _note("changed" if (not existed or orig_val != str(effective_value)) else "noop",
+                  adapter=ad["desc"], subkey=subkey_name, property=prop_name,
+                  intent=prop_name, old=orig_val, new=effective_value)
             logger.info("[DRY-RUN] Set %s=%s for %s (%s)", prop_name, effective_value, subkey_name, ad["desc"])
             success = True
             continue
@@ -913,15 +1302,39 @@ def _set_adapter_registry_value_safe(prop_name: str, value: str,
                 except FileNotFoundError:
                     existed = False
 
+                if existed and str(orig_val) == str(effective_value):
+                    logger.info("%s=%s already set for %s (%s). No change.",
+                                prop_name, effective_value, subkey_name, ad["desc"])
+                    _note("noop", adapter=ad["desc"], subkey=subkey_name,
+                          property=prop_name, intent=prop_name,
+                          old=orig_val, new=effective_value)
+                    success = True
+                    continue
+
                 winreg.SetValueEx(key, prop_name, 0, winreg.REG_SZ, str(effective_value))
                 _record_snapshot_entry(subkey_name, prop_name, orig_val, existed, str(effective_value))
+                read_back = winreg.QueryValueEx(key, prop_name)[0]
+                if str(read_back) != str(effective_value):
+                    logger.warning("Read-back mismatch for %s on %s: wrote %r, got %r",
+                                   prop_name, subkey_name, effective_value, read_back)
+                    _note("failed", adapter=ad["desc"], subkey=subkey_name,
+                          property=prop_name, intent=prop_name,
+                          reason=f"read-back mismatch ({read_back!r})")
+                    continue
+                _note("changed", adapter=ad["desc"], subkey=subkey_name,
+                      property=prop_name, intent=prop_name,
+                      old=orig_val, new=effective_value)
                 logger.info("Successfully set %s=%s for %s (miniport link will reinitialize)",
                             prop_name, effective_value, ad["desc"])
                 success = True
         except PermissionError:
             logger.warning("Access denied setting %s on %s. Run as Administrator.", prop_name, ad["desc"])
+            _note("failed", adapter=ad["desc"], subkey=subkey_name, property=prop_name,
+                  intent=prop_name, reason="access denied (run as administrator)")
         except Exception as e:
             logger.error("Error setting %s on %s: %s", prop_name, ad["desc"], e)
+            _note("failed", adapter=ad["desc"], subkey=subkey_name, property=prop_name,
+                  intent=prop_name, reason=str(e))
 
     return success
 
@@ -967,32 +1380,121 @@ def set_background_scanning(enabled: bool = True, target_guid: Optional[str] = N
     return apply_intent("background_scanning", "on" if enabled else "off", target_guid)
 
 
-def set_power_saving(disable: bool = True, target_guid: Optional[str] = None) -> bool:
-    """Tier A: Configure Windows high-performance wireless power plan and MIMO Power Save."""
+def set_channel_width(band: str, width: str, target_guid: Optional[str] = None) -> bool:
+    """
+    Tier A: Force a narrower channel width.
+
+    At long range a 20 MHz channel concentrates the same transmit power into
+    half/quarter of the spectrum, which usually raises SNR per subcarrier and
+    cuts retries. It cannot create signal, but it often turns a 2-bar link from
+    unusable into usable. Width is applied only when the driver exposes the
+    corresponding NDIS keyword.
+    """
+    intent = "channel_width_24" if str(band).startswith("2.4") else "channel_width_52"
+    semantic = "20MHz" if str(width).lower().replace(" ", "") in ("20", "20mhz") else "auto"
+    return apply_intent(intent, semantic, target_guid)
+
+
+def _active_power_scheme() -> Optional[str]:
     if _suppress_mutations():
-        logger.info("[%s] Power saving disabled: %s",
-                    "PREVIEW" if _PREVIEW_MODE else "DRY-RUN", disable)
-        apply_intent("mimo_power_save", "disable" if disable else "enable", target_guid)
+        return "SCHEME_CURRENT"
+    try:
+        res = subprocess.run(
+            ["powercfg", "/getactivescheme"], capture_output=True, text=True, timeout=10,
+            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0)
+        m = re.search(r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})",
+                      res.stdout or "")
+        if m:
+            return m.group(1)
+    except Exception as e:
+        logger.debug("powercfg scheme query failed: %s", e)
+    return None
+
+
+def _query_wireless_power() -> Optional[Dict[str, int]]:
+    """Read the current AC/DC wireless power-saving index (0=max perf .. 3=max saving)."""
+    try:
+        res = subprocess.run(
+            ["powercfg", "/query", "SCHEME_CURRENT", WIRELESS_SUBGROUP, WIRELESS_SETTING],
+            capture_output=True, text=True, timeout=10,
+            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0)
+        if res.returncode != 0:
+            return None
+        vals = re.findall(r"0x([0-9a-fA-F]+)", res.stdout or "")
+        if len(vals) >= 2:
+            return {"ac": int(vals[-2], 16), "dc": int(vals[-1], 16)}
+    except Exception as e:
+        logger.debug("powercfg query failed: %s", e)
+    return None
+
+
+def _set_wireless_power(index: int) -> bool:
+    if _suppress_mutations():
         return True
     try:
-        run_netsh(["wlan", "set", "autoconfig", "enabled=yes", "interface=Wi-Fi"])
-        subprocess.run(
-            ["powercfg", "/setacvalueindex", "SCHEME_CURRENT", "19caa947-ffe4-4a1e-a9a6-5d6ecab12b5a",
-             "12bbebe6-58d6-4636-95bb-3217ef867c1a", "000"],
-            capture_output=True, timeout=10,
-            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
-        )
-        subprocess.run(
+        cmds = [
+            ["powercfg", "/setacvalueindex", "SCHEME_CURRENT", WIRELESS_SUBGROUP, WIRELESS_SETTING, str(index)],
+            ["powercfg", "/setdcvalueindex", "SCHEME_CURRENT", WIRELESS_SUBGROUP, WIRELESS_SETTING, str(index)],
             ["powercfg", "/setactive", "SCHEME_CURRENT"],
-            capture_output=True, timeout=10,
-            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
-        )
-        # Resolve MIMO power save disable (Intel: MIMOPowerSaveMode -> "No SMPS")
-        apply_intent("mimo_power_save", "disable" if disable else "enable", target_guid)
-        return True
-    except Exception as e:
-        logger.error("Failed to set power plan: %s", e)
+        ]
+        for cmd in cmds:
+            res = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=10,
+                creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0)
+            if res.returncode != 0:
+                return False
+        # Read the value back. A zero exit code is not proof that the active
+        # scheme accepted the change.
+        check = _query_wireless_power()
+        if check and check.get("ac") == index and check.get("dc") == index:
+            return True
+        logger.warning("powercfg did not read back AC/DC=%s (got %s)", index, check)
         return False
+    except Exception as e:
+        logger.error("Failed to set wireless power plan: %s", e)
+        return False
+
+
+def set_power_saving(disable: bool = True, target_guid: Optional[str] = None) -> bool:
+    """
+    Tier A: Set the Windows wireless power plan (AC and DC) and the driver MIMO
+    power-save mode.
+
+    `disable=True` means "maximum performance" (index 0); `False` means the
+    battery-first profile (index 3, maximum power saving). Unlike the old
+    implementation this:
+      * uses both AC and DC indices (laptops on battery were ignored),
+      * detects the real interface name (the old code hardcoded "Wi-Fi"),
+      * never runs a localized netsh command that silently did nothing,
+      * reports whether the value actually changed.
+    """
+    target = 0 if disable else 3
+    label = "Wireless Power Plan (max performance)" if disable else "Wireless Power Plan (max saving)"
+    current = _query_wireless_power()
+    if current and current.get("ac") == target and current.get("dc") == target:
+        _note("noop", adapter="system", property="powercfg", intent=label,
+              old=current, new=target)
+        power_ok = True
+        logger.info("%s already set (AC/DC=%s). No change.", label, target)
+    else:
+        if _PREVIEW_MODE:
+            _PREVIEW_CHANGES.append({
+                "subkey": "-",
+                "adapter": "system",
+                "property": "Wireless power plan",
+                "intent": "Power plan",
+                "current": (f"AC {current.get('ac')} / DC {current.get('dc')}"
+                            if current else "unknown"),
+                "proposed": f"AC {target} / DC {target}",
+                "changed": True,
+            })
+        power_ok = _set_wireless_power(target)
+        _note("changed" if power_ok else "failed", adapter="system", property="powercfg",
+              intent=label, old=current, new=target,
+              reason=None if power_ok else "powercfg returned an error (administrator required?)")
+
+    mimo_ok = apply_intent("mimo_power_save", "disable" if disable else "enable", target_guid)
+    return bool(power_ok or mimo_ok)
 
 
 def flush_dns() -> bool:
@@ -1013,26 +1515,89 @@ def flush_dns() -> bool:
         return False
 
 
+def get_current_dns(adapter_name: Optional[str] = None) -> Optional[List[str]]:
+    """Return the interface's configured IPv4 DNS servers (locale-independent)."""
+    name = adapter_name or detect_wifi_interface_name() or "Wi-Fi"
+    ps = (f"(Get-DnsClientServerAddress -InterfaceAlias {_ps_quote(name)} "
+          "-AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses")
+    ok, out = run_powershell(ps)
+    if not ok:
+        return None
+    return [line.strip() for line in out.replace(",", "\n").splitlines() if line.strip()]
+
+
 def set_dns_servers(primary: str = "1.1.1.1", secondary: str = "8.8.8.8",
-                    adapter_name: str = "Wi-Fi") -> bool:
-    """Tier A: Set validated high-performance DNS resolvers."""
+                    adapter_name: Optional[str] = None) -> bool:
+    """Tier A: Set validated DNS resolvers on the real Wi-Fi interface."""
+    name = adapter_name or detect_wifi_interface_name() or "Wi-Fi"
+    desired = [primary] + ([secondary] if secondary else [])
+
     if _suppress_mutations():
-        if _PREVIEW_MODE:
+        # Preview/dry-run: read the real current DNS (read-only) so the preview
+        # does not claim a change that already exists.
+        current = get_current_dns(name)
+        changed = current is None or current[:len(desired)] != desired
+        if _PREVIEW_MODE and changed:
             _PREVIEW_CHANGES.append({
-                "subkey": "-", "adapter": adapter_name, "property": "DNS servers",
-                "intent": "DNS", "current": "(current DNS)", "proposed": f"{primary} / {secondary}",
+                "subkey": "-", "adapter": name, "property": "DNS servers",
+                "intent": "DNS",
+                "current": " / ".join(current) if current else "(DHCP)",
+                "proposed": " / ".join(desired),
                 "changed": True,
             })
-        logger.info("[%s] DNS set to %s, %s",
-                    "PREVIEW" if _PREVIEW_MODE else "DRY-RUN", primary, secondary)
+        _note("changed" if changed else "noop", adapter=name, property="DNS",
+              intent="DNS servers", old=current, new=desired)
+        logger.info("[%s] DNS %s to %s",
+                    "PREVIEW" if _PREVIEW_MODE else "DRY-RUN",
+                    "would change" if changed else "already", " / ".join(desired))
         return True
+
+    current = get_current_dns(name)
+    if current is not None and current[:len(desired)] == desired:
+        _note("noop", adapter=name, property="DNS", intent="DNS servers",
+              old=current, new=desired)
+        logger.info("DNS already set to %s. No change.", " / ".join(desired))
+        return True
+
     try:
-        ok1, _ = run_netsh(["interface", "ip", "set", "dns", f"name={adapter_name}", "static", primary, "primary"])
-        ok2, _ = run_netsh(["interface", "ip", "add", "dns", f"name={adapter_name}", secondary, "index=2"])
-        return ok1 or ok2
+        ok1, out1 = run_netsh(["interface", "ipv4", "set", "dnsservers",
+                               f"name={name}", "static", primary, "primary"])
+        ok2 = True
+        if secondary:
+            ok2, _ = run_netsh(["interface", "ipv4", "add", "dnsservers",
+                                f"name={name}", secondary, "index=2"])
+        if not (ok1 and ok2):
+            _note("failed", adapter=name, property="DNS", intent="DNS servers",
+                  old=current, new=desired,
+                  reason=out1.strip()[:200] or "netsh failed")
+            return False
+        # Read back the configured resolvers; a successful netsh exit code is
+        # not proof that the interface accepted them.
+        time.sleep(0.3)
+        verify = get_current_dns(name)
+        if verify is None or verify[:len(desired)] != desired:
+            _note("failed", adapter=name, property="DNS", intent="DNS servers",
+                  old=current, new=desired,
+                  reason=f"read-back mismatch ({verify})")
+            return False
+        _note("changed", adapter=name, property="DNS", intent="DNS servers",
+              old=current, new=desired)
+        return True
     except Exception as e:
         logger.error("Failed to set DNS: %s", e)
+        _note("failed", adapter=name, property="DNS", intent="DNS servers", reason=str(e))
         return False
+
+
+def reset_dns_to_dhcp(adapter_name: Optional[str] = None) -> bool:
+    """Undo set_dns_servers() by returning the interface to DHCP-provided DNS."""
+    name = adapter_name or detect_wifi_interface_name() or "Wi-Fi"
+    if _suppress_mutations():
+        return True
+    ok, _ = run_netsh(["interface", "ipv4", "set", "dnsservers", f"name={name}", "dhcp"])
+    if ok:
+        flush_dns()
+    return ok
 
 
 # -------------------------------------------------------------
@@ -1043,72 +1608,152 @@ def set_dns_servers(primary: str = "1.1.1.1", secondary: str = "8.8.8.8",
 # Short Guard Interval applies only to 802.11n (400ns) and 802.11ac (400ns) links.
 # 802.11ax/be links use standard 0.8us/1.6us/3.2us GI negotiated in the HE Operation element.
 
-def is_rss_supported(adapter_name: str = "Wi-Fi") -> bool:
-    """Check if the network interface hardware supports Receive Side Scaling (RSS)."""
-    if _suppress_mutations():
-        return True
+_TCP_AUTOTUNING = {0: "disabled", 1: "highlyrestricted", 2: "restricted", 3: "normal", 4: "experimental"}
+
+
+def get_tcp_state() -> Optional[Dict[str, int]]:
+    """Read the active TCP template values as numeric enums (locale-independent)."""
+    ps = ("Get-NetTCPSetting -SettingName Internet -ErrorAction SilentlyContinue | "
+          "Select-Object -First 1 -Property AutoTuningLevelLocal,EcnCapability,Timestamps | "
+          "ConvertTo-Json -Compress")
+    ok, out = run_powershell(ps)
+    if not ok or not out:
+        return None
     try:
-        clean_name = re.sub(r"[^a-zA-Z0-9_\-\. ]", "", adapter_name)
-        res = subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             f"(Get-NetAdapterRss -Name '{clean_name}' -ErrorAction SilentlyContinue).Enabled"],
-            capture_output=True, text=True, timeout=10,
-            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
-        )
-        out = res.stdout.strip().lower()
-        return "true" in out or "false" in out
+        data = json.loads(out)
+        return {k: int(v) for k, v in data.items() if isinstance(v, (int, float))}
     except Exception:
-        return False
+        return None
 
 
-def optimize_tcp_settings(adapter_name: str = "Wi-Fi") -> bool:
+def optimize_tcp_settings(adapter_name: Optional[str] = None, ecn: bool = False) -> bool:
     """
-    Tier B: Apply dynamic TCP stack optimizations.
-    Enables auto-tuning (RFC 1323) and ECN (RFC 3168).
-    Enables RSS only if hardware capability check passes.
-    (Note: DCA is an Intel server I/OAT feature and is not applied on client Wi-Fi).
+    Tier B: Bring a few TCP stack values to the intended state, skipping writes
+    that would be no-ops.
+
+    Honest scope:
+      * autotuning=normal is the Windows default; it is applied only if a prior
+        tool changed it.
+      * ECN is opt-in. It can reduce loss recovery latency only when the path
+        supports it; otherwise it is neutral. It is not a signal booster.
+      * RSS is intentionally NOT touched: on a single Wi-Fi flow it does not
+        change airtime or range.
     """
+    state = get_tcp_state()
+
     if _suppress_mutations():
-        if _PREVIEW_MODE:
-            _PREVIEW_CHANGES.append({
-                "subkey": "-", "adapter": adapter_name, "property": "TCP/IP stack",
-                "intent": "TCP", "current": "(current TCP config)",
-                "proposed": "autotuning=normal, ECN=enabled, RSS=enabled", "changed": True,
-            })
-        logger.info("[%s] TCP stack optimized",
-                    "PREVIEW" if _PREVIEW_MODE else "DRY-RUN")
+        at_now = (None if state is None
+                  else _TCP_AUTOTUNING.get(state.get("AutoTuningLevelLocal", -1)))
+        if at_now == "normal":
+            _note("noop", adapter="system", property="TCP autotuning",
+                  intent="TCP autotuning", old="normal", new="normal")
+        else:
+            _note("changed", adapter="system", property="TCP autotuning",
+                  intent="TCP autotuning", old=at_now, new="normal")
+            if _PREVIEW_MODE:
+                _PREVIEW_CHANGES.append({
+                    "subkey": "-", "adapter": "system", "property": "TCP autotuning",
+                    "intent": "TCP", "current": str(at_now), "proposed": "normal",
+                    "changed": True})
+        if ecn:
+            ecn_now = None if state is None else state.get("EcnCapability")
+            if ecn_now == 1:
+                _note("noop", adapter="system", property="TCP ECN",
+                      intent="TCP ECN", old="enabled", new="enabled")
+            else:
+                _note("changed", adapter="system", property="TCP ECN",
+                      intent="TCP ECN", old="disabled" if ecn_now == 0 else None,
+                      new="enabled")
+                if _PREVIEW_MODE:
+                    _PREVIEW_CHANGES.append({
+                        "subkey": "-", "adapter": "system", "property": "TCP ECN",
+                        "intent": "TCP", "current": "disabled" if ecn_now == 0 else "unknown",
+                        "proposed": "enabled", "changed": True})
         return True
 
-    cmds = [
-        ["interface", "tcp", "set", "global", "autotuninglevel=normal"],
-        ["interface", "tcp", "set", "global", "ecncapability=enabled"],
-    ]
+    ok_all = True
+    at_now = None if state is None else _TCP_AUTOTUNING.get(state.get("AutoTuningLevelLocal", -1))
+    if at_now != "normal":
+        ok, out = run_netsh(["interface", "tcp", "set", "global", "autotuninglevel=normal"])
+        if ok:
+            time.sleep(0.2)
+            after = get_tcp_state()
+            got = (None if after is None
+                   else _TCP_AUTOTUNING.get(after.get("AutoTuningLevelLocal", -1)))
+            if got != "normal":
+                _note("failed", adapter="system", property="TCP autotuning",
+                      intent="TCP autotuning", old=at_now, new="normal",
+                      reason=f"read-back mismatch ({got})")
+                ok = False
+            else:
+                _note("changed", adapter="system", property="TCP autotuning",
+                      intent="TCP autotuning", old=at_now, new="normal")
+        else:
+            _note("failed", adapter="system", property="TCP autotuning",
+                  intent="TCP autotuning", old=at_now, new="normal",
+                  reason=out.strip()[:200])
+        ok_all = ok_all and ok
+    else:
+        _note("noop", adapter="system", property="TCP autotuning",
+              intent="TCP autotuning", old="normal", new="normal")
 
-    if is_rss_supported(adapter_name):
-        cmds.append(["interface", "tcp", "set", "global", "rss=enabled"])
+    if ecn:
+        ecn_now = None if state is None else state.get("EcnCapability")
+        if ecn_now == 1:
+            _note("noop", adapter="system", property="TCP ECN", intent="TCP ECN",
+                  old="enabled", new="enabled")
+        else:
+            ok, out = run_netsh(["interface", "tcp", "set", "global", "ecncapability=enabled"])
+            if ok:
+                time.sleep(0.2)
+                after = get_tcp_state()
+                got = None if after is None else after.get("EcnCapability")
+                if got != 1:
+                    _note("failed", adapter="system", property="TCP ECN",
+                          intent="TCP ECN", old="disabled" if ecn_now == 0 else None,
+                          new="enabled", reason=f"read-back mismatch ({got})")
+                    ok = False
+                else:
+                    _note("changed", adapter="system", property="TCP ECN",
+                          intent="TCP ECN", old="disabled" if ecn_now == 0 else None,
+                          new="enabled")
+            else:
+                _note("failed", adapter="system", property="TCP ECN",
+                      intent="TCP ECN", old="disabled" if ecn_now == 0 else None,
+                      new="enabled", reason=out.strip()[:200])
+            ok_all = ok_all and ok
 
-    all_ok = True
-    for cmd in cmds:
-        ok, out = run_netsh(cmd)
-        if not ok:
-            logger.debug("TCP setting %s notice: %s", cmd, out)
-            all_ok = False
-    return all_ok
+    return ok_all
 
 
 def apply_advanced_tier_b_tweaks(enable_packet_coalescing_disable: bool = False,
                                  target_guid: Optional[str] = None,
-                                 connection_phy: Optional[str] = None) -> List[str]:
+                                 connection_phy: Optional[str] = None,
+                                 channel_width_24: Optional[str] = None,
+                                 channel_width_52: Optional[str] = None,
+                                 disable_uapsd: bool = True) -> List[str]:
     """
-    Tier B (Advanced / Opt-In):
-    Applies optional driver-level latency tweaks via vendor-agnostic intents.
-    Short GI is gated on connection_phy: applied for 802.11n/ac, skipped for 802.11ax/be.
+    Tier B (Advanced / Opt-In): optional driver-level latency/robustness tweaks.
+
+    Every item is resolved against the driver's own Ndi\\params and silently
+    skipped when unsupported, so this never guesses a vendor code. Short GI is
+    gated on the active PHY (802.11ax/be negotiate GI in HE Operation and do not
+    use the legacy keyword).
     """
     applied = []
 
     # Priority / VLAN Tagging (802.1p Layer-2 frame tagging)
     if apply_intent("priority_vlan_tag", "on", target_guid):
-        applied.append("QoS / Priority Tagging (802.1p Layer-2) -> Enabled")
+        applied.append("QoS / Priority Tagging (802.1p) -> Enabled")
+
+    # Channel width is the one client-side lever that materially changes SNR at
+    # long range: 20 MHz concentrates power instead of spreading it over 40/80.
+    if channel_width_24:
+        if set_channel_width("2.4GHz", channel_width_24, target_guid):
+            applied.append(f"2.4 GHz width -> {channel_width_24}")
+    if channel_width_52:
+        if set_channel_width("5GHz", channel_width_52, target_guid):
+            applied.append(f"5 GHz width -> {channel_width_52}")
 
     # Short Guard Interval: evaluated against active connection PHY
     if connection_phy and any(k in connection_phy.lower() for k in ["ax", "be", "wi-fi 6", "wifi 6"]):
@@ -1118,48 +1763,81 @@ def apply_advanced_tier_b_tweaks(enable_packet_coalescing_disable: bool = False,
             if _set_adapter_registry_value_safe(prop, "1", target_guid=target_guid, verify_ndi_support=True):
                 applied.append(f"{prop.replace('*', '')} -> Enabled (HT/VHT SGI 400ns)")
 
-    # Packet Coalescing (trade battery idle states for lower jitter)
+    # Packet Coalescing (trades battery idle states for lower jitter)
     if enable_packet_coalescing_disable:
         if apply_intent("packet_coalescing", "off", target_guid):
-            applied.append("Packet Coalescing -> Disabled (minimum latency jitter)")
+            applied.append("Packet Coalescing -> Disabled")
 
     # Vendor-specific throughput bursting (Intel Throughput Booster, etc.)
     if apply_intent("throughput_booster", "on", target_guid):
-        applied.append("Throughput Booster -> Enabled (driver frame aggregation)")
+        applied.append("Throughput Booster -> Enabled")
 
-    # U-APSD off reduces latency at the cost of battery
-    if apply_intent("uapsd", "off", target_guid):
-        applied.append("U-APSD -> Disabled (lower latency)")
+    # U-APSD off reduces latency at the cost of battery. It does NOT give the
+    # client priority over other stations (the old "selfish airtime" claim).
+    if disable_uapsd and apply_intent("uapsd", "off", target_guid):
+        applied.append("U-APSD -> Disabled (lower latency, higher battery use)")
 
     return applied
 
 
-def apply_selfish_airtime_boost(target_guid: Optional[str] = None,
-                                connection_phy: Optional[str] = None) -> List[str]:
-    """
-    Legacy wrapper for UI compatibility:
-    Applies Tier B advanced optimizations using discovery validation.
-    """
+def apply_latency_tweaks(target_guid: Optional[str] = None,
+                         connection_phy: Optional[str] = None) -> List[str]:
+    """Honest alias for the opt-in Tier B bundle (formerly 'selfish airtime')."""
     return apply_advanced_tier_b_tweaks(enable_packet_coalescing_disable=True,
                                         target_guid=target_guid,
                                         connection_phy=connection_phy)
 
 
-def reset_wifi_adapter(adapter_name: str = "Wi-Fi") -> bool:
-    """Safe adapter reset to clear hung link states (never run during active streaming)."""
+def restart_adapter(adapter_name: Optional[str] = None,
+                    wait_seconds: int = 25) -> Tuple[bool, str]:
+    """
+    Disable/enable the Wi-Fi adapter and wait for reconnection.
+
+    Registry values for NDIS keywords are read by the miniport when it
+    initializes. Without this step most "applied" changes do nothing until the
+    next reboot, which is why the old app could claim success while the link was
+    unchanged.
+    """
+    name = adapter_name or detect_wifi_interface_name() or "Wi-Fi"
     if _suppress_mutations():
-        logger.info("[%s] Adapter %s reset simulated",
-                    "PREVIEW" if _PREVIEW_MODE else "DRY-RUN", adapter_name)
-        return True
+        logger.info("[%s] Adapter %s restart simulated",
+                    "PREVIEW" if _PREVIEW_MODE else "DRY-RUN", name)
+        return True, f"[simulated] Adapter '{name}' restart"
 
+    # Ask the supplicant to drop the link first; otherwise some drivers keep the
+    # old association alive across a disable/enable cycle.
     try:
-        subprocess.run(["netsh", "wlan", "disconnect"], capture_output=True, timeout=5,
-                       creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0)
-        run_netsh(["interface", "set", "interface", adapter_name, "disable"])
-        time.sleep(1)
-        run_netsh(["interface", "set", "interface", adapter_name, "enable"])
-        return True
-    except Exception as e:
-        logger.error("Failed to reset adapter: %s", e)
-        return False
+        run_netsh(["wlan", "disconnect", f"interface={name}"])
+    except Exception:
+        pass
 
+    ok_down, out_down = run_netsh(["interface", "set", "interface", name, "admin=disabled"])
+    time.sleep(1.5)
+    ok_up, out_up = run_netsh(["interface", "set", "interface", name, "admin=enabled"])
+
+    if not (ok_down and ok_up):
+        # netsh can fail on localized/mismatched names; try the cmdlet once.
+        ps = f"Restart-NetAdapter -Name {_ps_quote(name)} -Confirm:$false -ErrorAction Stop"
+        ok_ps, _ = run_powershell(ps, timeout=30)
+        if not ok_ps:
+            return False, (f"Could not restart '{name}'. Run as administrator, or toggle "
+                           f"Wi-Fi off/on once. ({out_down.strip()[:120]})")
+
+    deadline = time.time() + max(5, int(wait_seconds))
+    while time.time() < deadline:
+        conn = wlan_native.get_connection()
+        if conn:
+            return True, (f"Adapter '{name}' restarted and reconnected to "
+                          f"'{conn.get('ssid', '?')}' "
+                          f"({conn.get('rssi_dbm', 0):.0f} dBm, "
+                          f"{conn.get('rx_mbps', 0):.0f} Mbps rx).")
+        time.sleep(1.5)
+
+    return False, (f"Adapter '{name}' restarted but did not reconnect within "
+                   f"{wait_seconds}s. Windows will keep trying; no settings were lost.")
+
+
+def reset_wifi_adapter(adapter_name: Optional[str] = None) -> bool:
+    """Backward-compatible bool wrapper around restart_adapter()."""
+    ok, _ = restart_adapter(adapter_name)
+    return ok

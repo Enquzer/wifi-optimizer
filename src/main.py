@@ -16,14 +16,22 @@ if BASE_DIR not in sys.path:
 ASSETS_DIR = os.path.join(BASE_DIR, "assets")
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
+# Windows consoles often use cp1252; the UI/log messages contain arrows and
+# emoji. Reconfigure (best effort) so logging never raises UnicodeEncodeError.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 LOG_FILE = os.path.join(BASE_DIR, "wifi_optimizer.log")
+_handlers = [logging.FileHandler(LOG_FILE, encoding="utf-8")]
+if sys.stderr is not None:
+    _handlers.append(logging.StreamHandler(sys.stderr))
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_FILE, encoding="utf-8"),
-        logging.StreamHandler(sys.stdout),
-    ],
+    handlers=_handlers,
 )
 logger = logging.getLogger("main")
 
@@ -100,19 +108,13 @@ def main():
     # ── Attach monitor callbacks ──────────────────────────────────────────────
     if monitor:
         try:
-            from ui.notifications import notify_signal_weak, notify_signal_restored
-
             def _alert(title: str, msg: str):
+                # The monitor only raises notifications. Mode changes are made
+                # by the hysteretic controller in app._apply_snapshot(), which
+                # sees every sample and has its own cooldown.
                 try:
                     from ui.notifications import notify
                     notify(title, msg, duration="long")
-                    if "Weak" in title and app:
-                        # Auto-optimize on weak signal if enabled
-                        try:
-                            if hasattr(app, '_auto_opt_var') and app._auto_opt_var.get():
-                                app.after(0, app._do_optimize)
-                        except Exception:
-                            pass
                 except Exception:
                     pass
 

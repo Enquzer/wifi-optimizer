@@ -1,137 +1,186 @@
 # 📶 WiFi Optimizer
 
-> **⚡ Powered by Fashion Flow 2026**  
+> **Powered by Fashion Flow 2026**
+>
 > **Developed by Enquzer Getachew**
 
-[![Windows](https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011-blue.svg)](https://microsoft.com/windows)
-[![Python](https://img.shields.io/badge/Python-3.10%2B-green.svg)](https://python.org)
-[![NDIS](https://img.shields.io/badge/Driver-NDIS%206.x%2B-orange.svg)]()
-[![Status](https://img.shields.io/badge/Status-Production--Grade-brightgreen.svg)]()
+Windows 10/11 client-side Wi-Fi diagnostics and link-robustness tool.
 
-WiFi Optimizer is a custom-engineered, multi-layer Wi-Fi optimization and diagnostic platform for Windows 10 and 11. It bridges physical RF radio telemetry, access point contention, OEM driver NDIS registry parameters, and the Windows Kernel TCP/IP transport layer.
-
-Unlike generic "cleaners" or passive scanners, WiFi Optimizer discovers hardware properties directly from your adapter's driver database (`Ndi\params`), resolves vendor-inverted enum codes (Intel vs. Realtek), enforces non-destructive closed-loop link stability, and optimizes the Windows kernel network pipe.
+This is **not** a signal booster. A program running on your laptop cannot raise the
+router's transmit power, move the router, or remove walls. What it can do is read
+the real link, choose sensible client settings, apply them correctly, verify that
+they were applied, and measure whether the link actually improved.
 
 ---
 
-## ⚖️ Demystifying Scores: Signal vs. Quality vs. Optimization
+## What it does
 
-A common source of confusion in Wi-Fi utilities is conflating antenna signal strength with network performance:
+| Area | Reality |
+|---|---|
+| **Telemetry** | Reads RSSI (dBm), link quality, center frequency, channel/band, negotiated PHY rates and security from the Windows Native Wi-Fi API (`wlanapi.dll`). No localized `netsh` text parsing on the primary path. |
+| **Scanning** | Returns **one entry per BSSID**, not one per SSID. Mesh nodes and dual-band APs are no longer collapsed into a single (often worst) row. |
+| **Scoring** | An explicit weighted sum: signal (30) + channel (20) + band (20) + PHY (20) + security (10). The weights are a UX heuristic, not a calibrated throughput model. |
+| **Applying** | Discovery-validated NDIS registry writes (only keywords the driver's `Ndi\params` exposes), power-plan changes, optional DNS/TCP changes, and a miniport reload when an NDIS value changed so it actually takes effect. |
+| **Verification** | Every write is read back and classified as **changed**, **already at target**, **failed**, or **unsupported**. There is no fabricated “15–40%” claim. |
+| **Measurement** | Single-stream HTTPS download, TCP-connect RTT (median/p95), jitter, loss, DNS time, and goodput ÷ PHY efficiency, saved to `benchmarks.jsonl`. |
 
-| Metric | UI Element | What It Measures | Why It Matters |
-| :--- | :--- | :--- | :--- |
-| **1. Signal Strength (Antenna Power)** | Circular Gauge (`Signal (RF)`) | Pure Layer-1 Radio Frequency (RF) power received by your Wi-Fi antenna ($P_{\text{rx}}$ in dBm or %). | Shows how "loud" the router's radio is received. **A loud router on a congested channel is still slow!** |
-| **2. Link Quality (M-BFF Score)** | Live Status Chip (`🎯 Link Quality`) | Holistic multi-factor fitness score (0–100) combining Signal (30) + Clean Channel (20) + 5G/6G Bandwidth (20) + Generation (20) + Security (10). | **The true measure of actual network speed and stability.** 65% signal on clean 5GHz Wi-Fi 6 is 5x faster than 95% signal on noisy 2.4GHz Wi-Fi 4! |
-| **3. Optimization Level (System Tuned)** | Result Badge (`100% Optimized`) | Percentage of client-side Windows adapter driver and kernel TCP/IP stack tweaks actively configured. | Confirms your PC's hardware and network pipe are operating without driver or OS throttling. |
+## What it cannot do
 
----
-
-## 🚀 Key Features
-
-* **🔍 Vendor-Agnostic NDIS Parameter Discovery**: Queries `HKLM\SYSTEM\CurrentControlSet\Control\Class\{4d36e972-e325-11ce-bfc1-08002be10318}\<Index>\Ndi\params` to identify properties officially supported by OEM drivers. Unsupported properties are skipped, never guessed.
-* **⚡ Solved Inverted Enum Traps**: Handles reversed vendor encodings automatically:
-  * **Intel (AX/BE series)**: `IbssTxPower` (`100` = Highest), `RoamAggressiveness` (`4` = Highest), `MIMOPowerSaveMode` (`3` = "No SMPS" disables power saving; setting `0` enables Auto SMPS!).
-  * **Realtek (RTL series)**: `TxPwrLevel` (`0` = Highest, `4` = Lowest!), `RegROAMSensitiveLevel` (`65` = Highest, `127` = Disabled!).
-* **📡 Native Hardware RSSI Telemetry**: Reads physical dBm directly via Windows Native Wi-Fi API (`wlanapi.dll` $\to$ `WlanGetNetworkBssList` $\to$ `lRssi`) with calibrated $\pm 1.5\text{ dB}$ uncertainty, avoiding inaccurate synthetic netsh heuristics.
-* **🛡️ Security Policy Gating**: Open (unencrypted plaintext) and WEP (broken RC4) networks are hard-disqualified (`is_eligible = False`). Client roaming is restricted to configured Windows profiles (`require_saved_profile=True`) to prevent rogue AP interception.
-* **👀 Read-Only Preview (Dry-Run) Mode**: Inspect proposed changes (`Current Value -> Proposed Value`) across all adapters before applying any modification.
-* **🔄 Closed-Loop Link Governor**: EWMA-smoothed telemetry ($\alpha = 0.3$) with dual-threshold hysteresis ($-75\text{ dBm}$ fall / $-70\text{ dBm}$ recovery), 30s roaming cooldown, and $15\text{ dB}$ gradient sudden drop rule over $\le 12\text{s}$.
-* **🌐 Windows Kernel TCP/IP Tuning**: Enables dynamic TCP Receive Window auto-tuning based on Bandwidth-Delay Product (BDP), multi-core Receive Side Scaling (RSS), and RFC 3168 Explicit Congestion Notification (ECN).
-* **🖥️ High-Readability Help Architecture**: In-app zoom controls (`➕ Zoom In`, `➖ Zoom Out`, `↺ 100%`) and `🗖 Fullscreen` toggle for effortless formula and diagram inspection.
+- Increase the router's EIRP or antenna gain.
+- Make a −85 dBm link fast.
+- Override the AP's channel, width, or EDCA parameters.
+- Guarantee a throughput improvement. The ISP, WAN link, other clients and
+  environmental noise all matter. The app reports measured deltas and lets you
+  decide whether they are real.
 
 ---
 
-## 📊 Mathematical Architecture & RF Physics
+## Profiles
 
-### 1. Multi-Objective BSSID Fitness Function (M-BFF)
-Every detected access point is evaluated across five objective dimensions:
+| Profile | Width | Band | Roaming | Power save | TCP | Intended use |
+|---|---|---|---|---|---|---|
+| **Far / Robust** | 20 MHz | 2.4 GHz preferred | 1/5 (minimum) | off | no | Weak/far links where retries dominate |
+| **Balanced** | auto | auto | 2/5 | off | yes | General use |
+| **Max Speed** | auto | 5/6 GHz preferred | 3/5 | off | yes | Strong signal, short range |
+| **Power Saver** | auto | 2.4 GHz | 3/5 | on | no | Battery first; higher latency |
 
-$$S(N) = f_{\text{sig}}(P_{\text{rx}}) + f_{\text{cong}}(C) + f_{\text{band}}(B, P_{\text{rx}}) + f_{\text{phy}}(R) + f_{\text{sec}}(A) \in [0, 100\text{ Pts}]$$
+`max_range` and the legacy `selfish` key are aliases for **Far / Robust**.
 
-#### A. Calibrated Continuous Sigmoid Signal Function ($0 - 30\text{ Pts}$)
-$$f_{\text{sig}}(P_{\text{rx}}) = \frac{30.0}{1 + e^{-0.35(P_{\text{rx}} + 72.0)}}$$
-* $P_{\text{rx}} \ge -55\text{ dBm} \implies 29.9\text{ pts}$ (Near-field saturation / Peak SNR)
-* $P_{\text{rx}} = -72\text{ dBm} \implies 15.0\text{ pts}$ (Calibrated inflection point)
-* $P_{\text{rx}} \le -90\text{ dBm} \implies < 0.1\text{ pts}$ (Sensitivity floor)
+DNS is **never** changed unless you enable *Apply these DNS servers when
+optimizing* on the Settings page. DNS does not affect RF or throughput. ECN is
+also opt-in and off by default; it is enabled only when the Settings switch asks
+for it (or a script passes `apply_ecn=True`).
 
-#### B. 22 MHz Spectral Mask Overlap Integral ($0 - 20\text{ Pts}$)
-$$w_{\text{ov}}(\Delta ch) = \max\left(0.0, \text{round}\left(1.0 - \frac{|\Delta ch| \cdot 5\text{ MHz}}{22\text{ MHz}}, 2\right)\right)$$
-* $\Delta ch = 0 \implies 1.00$ (Co-channel contention)
-* $\Delta ch = 1 \implies 0.77$ (Severe adjacent spillover)
-* $\Delta ch = 2 \implies 0.55$ (High adjacent spillover)
-* $\Delta ch = 3 \implies 0.32$ (Moderate channel bleed)
-* $\Delta ch = 4 \implies 0.09$ (Marginal filter rolloff overlap)
-* $\Delta ch \ge 5 \implies 0.00$ (Orthogonal channels: 1, 6, 11)
-
-Effective congestion and score:
-$$C_{\text{eff}} = \sum_{j \in \mathcal{N}} \left[ w_{\text{ov}}(\Delta ch_j) \cdot w_{\text{sig}}(P_{\text{rx}, j}) \right] + 5 \cdot u$$
-$$f_{\text{cong}}(C) = \max(0.0, 20.0 - 5.0 \cdot C_{\text{eff}})$$
-
-#### C. Band Capacity & Attenuation Gate ($0 - 20\text{ Pts}$)
-$$f_{\text{band}}(B, P_{\text{rx}}) = B \cdot \left[ \frac{1}{1 + e^{-0.25(P_{\text{rx}} + 80.0)}} \right]$$
-* 6 GHz ($B = 20\text{ pts}$), 5 GHz ($B = 18\text{ pts}$), 2.4 GHz ($B = 8\text{ pts}$).
-
-#### D. PHY Modulation Standard ($0 - 20\text{ Pts}$)
-* Wi-Fi 7 (802.11be, 4096-QAM, 320 MHz, MLO): **$20.0\text{ Pts}$**
-* Wi-Fi 6/6E (802.11ax, 1024-QAM, OFDMA): **$18.0\text{ Pts}$**
-* Wi-Fi 5 (802.11ac, 256-QAM, 80 MHz): **$14.0\text{ Pts}$**
-* Wi-Fi 4 (802.11n, 64-QAM, MIMO): **$9.0\text{ Pts}$**
-* Legacy (802.11a/b/g): **$3.0\text{ Pts}$**
-
-#### E. Security Evaluation & Policy Gating ($0 - 10\text{ Pts}$)
-* WPA3-SAE: **$10.0\text{ Pts}$**
-* WPA2-AES (CCMP): **$8.0\text{ Pts}$**
-* WPA2-TKIP: **$3.0\text{ Pts}$**
-* Open / WEP: **Hard Disqualification** (`is_eligible = False`)
+Why 20 MHz at range: the same transmit power concentrated into a narrower channel
+usually raises SNR per subcarrier and reduces retries. It lowers the peak PHY rate,
+but a link that survives retries is often faster in practice than a wide link that
+keeps collapsing. This is a trade-off, not a magic gain.
 
 ---
 
-### 2. Environmental Propagation Range Intervals
-Friis 1-meter reference path loss:
-$$\text{FSPL}_{1\text{m}}(\text{dB}) = 20\log_{10}(f_{\text{MHz}}) - 27.55$$
+## Measurement
 
-Environmental range interval estimation:
-$$d_n = 10^{\frac{P_{\text{tx}} - P_{\text{rx}} - \text{FSPL}_{1\text{m}}}{10 \cdot n}}$$
-* $n = 2.0$: Free Space / Line-of-Sight (LOS)
-* $n = 3.0$: Indoor Residential / Drywall Partitions
-* $n = 4.0$: Dense Concrete & Brick Obstructions
+```powershell
+python scripts/benchmark.py --reps 3 --label before
+# change a profile / move the laptop
+python scripts/benchmark.py --reps 3 --label after
+```
+
+Or use the dashboard's **Measure before/after** switch. Results are appended to
+`benchmarks.jsonl`; compare medians, not single samples.
+
+```powershell
+python scripts/verify_optimization.py before
+# run the optimizer
+python scripts/verify_optimization.py after
+```
+
+`verify_optimization.py` prints before → after RSSI, band/channel, PHY rate,
+throughput, RTT, jitter, loss, and the exact registry entries the optimizer
+touched.
+
+### Metric definitions
+
+- **RSSI (dBm)** — received RF power. Native resolution is about 1 dB; treat it as
+  ±1–2 dB, not a calibrated instrument.
+- **Link quality (%)** — driver-reported 0–100 indicator. It is not linear in dBm.
+- **PHY rate (Mbps)** — negotiated modulation/coding rate, not Internet throughput.
+- **Efficiency** — measured download goodput ÷ `min(rx, tx)` PHY rate. Low with a
+  decent RSSI usually means a wide/congested channel; low with a low RSSI means
+  you are at the sensitivity edge.
+- **p95 RTT** — 95th percentile TCP-connect time. More useful than an average when
+  the link is retrying.
 
 ---
 
-## 🛠️ Installation & Running
+## Safety and reversibility
+
+- **Preview mode** shows current → proposed values and writes nothing.
+- **Timestamped backups** (`adapter_settings_backup_YYYYMMDD_HHMMSS.json`, five
+  newest kept) are written before changes. The old fixed-name backup was
+  overwritten after optimization and is deliberately ignored.
+- **System snapshot** (`system_rollback_snapshot.json`) records DNS, the wireless
+  power-plan AC/DC indices, and TCP autotuning/ECN/timestamps.
+- **Restore Defaults** replays the registry change log **and** the system snapshot,
+  skips stale adapter subkeys from renamed/ghost drivers, then reloads the adapter
+  if registry values were restored. Failed restores keep the snapshot so they can
+  be retried after elevation.
+- **Driver discovery** means unsupported properties are skipped, never guessed.
+
+Registry and NDIS changes require **Administrator**. Without elevation the app
+reports them as failed instead of pretending they worked. DNS/TCP changes may
+still apply, and they are snapshotted so they can be undone.
+
+---
+
+## Auto-optimize (opt-in)
+
+The background monitor can apply a profile when the link is degraded or recovers.
+It is:
+
+- **off by default**,
+- rate-limited to once per 15 minutes,
+- hysteretic (the controller requires a sustained condition),
+- disruptive for a few seconds because the adapter reloads.
+
+It uses `RobustnessController` from `src/core/robustness.py`: EWMA smoothing,
+two-sample persistence, and a cooldown. Background automation is created with
+`allow_speed=False`, so it only moves **Far / Robust ↔ Balanced**; it never
+auto-widens a good link to `max_speed` and never restarts the adapter just
+because the signal is strong.
+
+---
+
+## Installation
 
 ### Requirements
-* Windows 10 or 11 (64-bit)
-* Python 3.10+ (for source execution)
-* Administrator privileges (required to configure Windows NDIS adapter properties and TCP/IP stack)
 
-### Option 1: Run from Source
+- Windows 10 or 11 (64-bit)
+- Python 3.10+ for source execution
+- Administrator privileges for NDIS/registry changes
+
+### Run from source
+
 ```powershell
-# Clone the repository
-git clone https://github.com/Enquzer/wifi-optimizer.git
-cd wifi-optimizer
-
-# Install dependencies
 pip install -r scripts/requirements.txt
-
-# Run application
 python src/main.py
 ```
 
-### Option 2: Pre-Packaged Standalone Executable
-Launch [`app_bin/WiFi Optimizer/WiFi Optimizer.exe`](file:///d:/my_codes/Wifi%20optimizer/app_bin/WiFi%20Optimizer/WiFi%20Optimizer.exe) directly or click `WiFi Optimizer.lnk`.
+### Packaged build
+
+Launch `app_bin/WiFi Optimizer/WiFi Optimizer.exe` or the provided shortcut.
 
 ---
 
-## 🔒 Safety & Reversibility
+## Project layout
 
-* **Zero Disruptions**: The background Link Governor never resets active adapters or interrupts open streams.
-* **Automatic Snapshots**: Captures `adapter_rollback_snapshot.json` prior to any modification.
-* **One-Click Restore**: "Restore Defaults" reverts all modified keys to original values and cleans up newly created parameters.
+```
+src/core/wlan_native.py     Native Wi-Fi API telemetry (locale-independent)
+src/core/wifi_scanner.py    BSS/connection model + netsh fallback
+src/core/adapter_manager.py Discovery, writes, change ledger, backup/rollback
+src/core/optimizer.py       Profiles, scoring, actuation
+src/core/benchmark.py       Real download/RTT/jitter/DNS measurement
+src/core/robustness.py      Hysteretic far/balanced/speed controller
+src/core/monitor.py         Background sampler + governor
+src/ui/app.py               GUI
+scripts/benchmark.py        CLI measurement
+scripts/verify_optimization.py  Before/after comparison
+scripts/test_core.py        Fast logic checks (no admin/network writes)
+```
+
+## Limitations
+
+- Throughput samples are noisy; background traffic and other clients affect them.
+- A driver that does not expose a width/band keyword cannot be narrowed by software.
+- 2.4/5/6 GHz channel numbers overlap; band classification uses the native center
+  frequency, and the netsh fallback is explicitly ambiguous.
+- The scoring weights and controller thresholds are starting points, not universal
+  constants. Tune them in `optimizer.py` / `robustness.py`.
 
 ---
 
-## 📄 License & Credits
-* **⚡ Powered by Fashion Flow 2026**
-* **Developed by Enquzer Getachew**
-* Licensed under the MIT License.
+## License & Credits
+
+- **Powered by Fashion Flow 2026**
+- **Developed by Enquzer Getachew**
+- MIT License
